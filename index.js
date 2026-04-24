@@ -5,14 +5,15 @@ const {
   REST,
   Routes,
   SlashCommandBuilder,
-  MessageFlags,
 } = require("discord.js");
 
-const TARGET_USER_ID = "9158302482";
-const TARGET_GROUP_ID = "351622539";
-
-const TARGET_USER_URL = `https://www.roblox.com/users/${TARGET_USER_ID}/profile`;
-const TARGET_GROUP_URL = `https://www.roblox.com/communities/${TARGET_GROUP_ID}`;
+const TARGETS = {
+  follows: [
+    { name: "Loosly", id: "9158302482" },
+    { name: "Devsplaces", id: "6080558258" },
+  ],
+  group: { name: "SHM", id: "351622539" },
+};
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
@@ -42,12 +43,14 @@ async function isInGroup(userId, groupId) {
   if (!res.ok) return { error: "api_error" };
   const data = await res.json();
   const found = (data.data || []).find((g) => String(g.group?.id) === String(groupId));
-  return { inGroup: !!found, role: found?.role?.name || null };
+  return { inGroup: !!found };
 }
 
-async function isFollowing(userId, targetUserId) {
+async function getFollowedTargets(userId, targetIds) {
+  const matched = new Set();
+  const remaining = new Set(targetIds.map(String));
   let cursor = "";
-  for (let page = 0; page < 20; page++) {
+  for (let page = 0; page < 25 && remaining.size > 0; page++) {
     const url = new URL(`https://friends.roblox.com/v1/users/${userId}/followings`);
     url.searchParams.set("limit", "100");
     url.searchParams.set("sortOrder", "Desc");
@@ -55,18 +58,22 @@ async function isFollowing(userId, targetUserId) {
     const res = await fetch(url.toString());
     if (!res.ok) return { error: "api_error" };
     const data = await res.json();
-    if ((data.data || []).some((u) => String(u.id) === String(targetUserId))) {
-      return { following: true };
+    for (const u of data.data || []) {
+      const id = String(u.id);
+      if (remaining.has(id)) {
+        matched.add(id);
+        remaining.delete(id);
+      }
     }
-    if (!data.nextPageCursor) return { following: false };
+    if (!data.nextPageCursor) break;
     cursor = data.nextPageCursor;
   }
-  return { following: false, truncated: true };
+  return { matched };
 }
 
 const checkCommand = new SlashCommandBuilder()
   .setName("check")
-  .setDescription("Check if a Roblox account follows the target user and is in the target group.")
+  .setDescription("Check if a Roblox account follows the target users and is in the target group.")
   .addStringOption((opt) =>
     opt
       .setName("account")
@@ -83,6 +90,10 @@ async function registerCommands() {
   console.log("Slash command /check registered globally.");
 }
 
+const yes = "✅ Yes";
+const no = "❌ No";
+const apiErr = "⚠️ API error";
+
 client.on("interactionCreate", async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
   if (interaction.commandName !== "check") return;
@@ -98,49 +109,28 @@ client.on("interactionCreate", async (interaction) => {
     return interaction.editReply("Roblox API error while resolving the username. Please try again.");
   }
 
+  const followIds = TARGETS.follows.map((t) => t.id);
   const [groupRes, followRes] = await Promise.all([
-    isInGroup(user.id, TARGET_GROUP_ID),
-    isFollowing(user.id, TARGET_USER_ID),
+    isInGroup(user.id, TARGETS.group.id),
+    getFollowedTargets(user.id, followIds),
   ]);
 
   const profileUrl = `https://www.roblox.com/users/${user.id}/profile`;
-  const inGroupLine = groupRes.error
-    ? "Group check: API error"
-    : groupRes.inGroup
-    ? `In group: Yes${groupRes.role ? ` (role: ${groupRes.role})` : ""}`
-    : "In group: No";
-  const followLine = followRes.error
-    ? "Follow check: API error"
-    : followRes.following
-    ? "Following user: Yes"
-    : followRes.truncated
-    ? "Following user: Not found in first 2000 follows"
-    : "Following user: No";
 
-  const allOk =
-    !groupRes.error && !followRes.error && groupRes.inGroup && followRes.following;
-  const color = allOk ? 0x57f287 : 0xed4245;
+  const fields = TARGETS.follows.map((t) => ({
+    name: `Follows ${t.name}  (${t.id})`,
+    value: followRes.error ? apiErr : followRes.matched.has(t.id) ? yes : no,
+  }));
+  fields.push({
+    name: `In Group ${TARGETS.group.name} (${TARGETS.group.id})`,
+    value: groupRes.error ? apiErr : groupRes.inGroup ? yes : no,
+  });
 
   const embed = new EmbedBuilder()
-    .setColor(color)
+    .setColor(0x5865f2)
     .setTitle(`${user.displayName} (@${user.name})`)
     .setURL(profileUrl)
-    .setDescription(
-      [
-        `**Roblox ID:** [\`${user.id}\`](${profileUrl})`,
-        "",
-        `**Target user:** [\`${TARGET_USER_ID}\`](${TARGET_USER_URL})`,
-        `**Target group:** [\`${TARGET_GROUP_ID}\`](${TARGET_GROUP_URL})`,
-        "",
-        followLine,
-        inGroupLine,
-        "",
-        allOk
-          ? "Verified — meets all requirements."
-          : "Not verified — at least one requirement is missing.",
-      ].join("\n"),
-    )
-    .setFooter({ text: "Tip: tap the IDs above to copy on mobile." });
+    .addFields(fields);
 
   await interaction.editReply({ embeds: [embed] });
 });

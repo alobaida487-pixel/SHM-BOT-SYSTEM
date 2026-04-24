@@ -5,10 +5,11 @@ A small Discord bot that verifies whether a Roblox account follows a specific us
 ## Command
 
 - `/check account:<roblox_username_or_id>` — slash command that looks up the Roblox account and reports:
-  - whether it follows user ID `9158302482`
-  - whether it is in group ID `351622539`
+  - whether it follows Loosly (`9158302482`)
+  - whether it follows Devsplaces (`6080558258`)
+  - whether it is in group SHM (`351622539`)
 
-The reply embed shows both target IDs as clickable links to roblox.com and inside backticks so they can be tapped to copy on mobile Discord.
+Each check is shown as a separate embed field with a ✅ Yes / ❌ No value.
 
 The slash command is registered globally on startup. New global commands may take up to an hour to appear in clients the first time.
 
