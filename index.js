@@ -384,14 +384,19 @@ function ticketWelcomeEmbed(ticket, owner) {
     )
     .setTimestamp(new Date(ticket.createdAt));
 }
-function ticketCloseRow() {
-  return new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`ticket:close`)
-      .setLabel("Close Ticket")
-      .setEmoji("🔒")
-      .setStyle(ButtonStyle.Danger),
-  );
+function ticketActionRow(ticket) {
+  const claimBtn = new ButtonBuilder()
+    .setCustomId("ticket:claim")
+    .setLabel(ticket.claimedBy ? "Claimed" : "Claim")
+    .setEmoji("✋")
+    .setStyle(ticket.claimedBy ? ButtonStyle.Secondary : ButtonStyle.Success)
+    .setDisabled(!!ticket.claimedBy);
+  const closeBtn = new ButtonBuilder()
+    .setCustomId("ticket:close")
+    .setLabel("Close Ticket")
+    .setEmoji("🔒")
+    .setStyle(ButtonStyle.Danger);
+  return new ActionRowBuilder().addComponents(claimBtn, closeBtn);
 }
 function ticketConfirmCloseRow(ticketId) {
   return new ActionRowBuilder().addComponents(
@@ -480,6 +485,9 @@ async function createTicketChannel(interaction, cfg) {
     closed: false,
     closedBy: null,
     closedAt: null,
+    claimedBy: null,
+    claimedAt: null,
+    panelMessageId: null,
   };
   store.tickets.push(ticket);
   saveData(store);
@@ -487,14 +495,53 @@ async function createTicketChannel(interaction, cfg) {
   const pingContent = cfg.staffRoleId
     ? `<@${interaction.user.id}> <@&${cfg.staffRoleId}>`
     : `<@${interaction.user.id}>`;
-  await channel.send({
+  const sent = await channel.send({
     content: pingContent,
     embeds: [ticketWelcomeEmbed(ticket, interaction.user)],
-    components: [ticketCloseRow()],
+    components: [ticketActionRow(ticket)],
     allowedMentions: { users: [interaction.user.id], roles: cfg.staffRoleId ? [cfg.staffRoleId] : [] },
   });
+  ticket.panelMessageId = sent.id;
+  saveData(store);
 
   return { ticket, channel };
+}
+
+async function handleTicketClaimButton(interaction) {
+  const ticket = getTicketByChannel(interaction.channelId);
+  if (!ticket || ticket.closed) {
+    return interaction.reply({ content: "This ticket is no longer open.", flags: MessageFlags.Ephemeral });
+  }
+  const cfg = getTicketConfig(interaction.guildId);
+  if (!(await isStaffMember(interaction.guild, interaction.member, cfg))) {
+    return interaction.reply({ content: "Only staff can claim tickets.", flags: MessageFlags.Ephemeral });
+  }
+  if (ticket.claimedBy) {
+    return interaction.reply({
+      content: `This ticket is already claimed by <@${ticket.claimedBy}>.`,
+      flags: MessageFlags.Ephemeral,
+      allowedMentions: { parse: [] },
+    });
+  }
+  ticket.claimedBy = interaction.user.id;
+  ticket.claimedAt = Date.now();
+  saveData(store);
+
+  try {
+    if (ticket.panelMessageId) {
+      const msg = await interaction.channel.messages.fetch(ticket.panelMessageId);
+      await msg.edit({ components: [ticketActionRow(ticket)] });
+    }
+  } catch {}
+
+  await interaction.reply({
+    embeds: [
+      new EmbedBuilder()
+        .setColor(0x57f287)
+        .setDescription(`✋ Ticket claimed by <@${interaction.user.id}>.`),
+    ],
+    allowedMentions: { parse: [] },
+  });
 }
 
 async function finalizeTicketClose(ticket, channel, closer, reason) {
@@ -520,12 +567,16 @@ async function finalizeTicketClose(ticket, channel, closer, reason) {
   }
 
   const opener = await client.users.fetch(ticket.userId).catch(() => null);
+  const claimer = ticket.claimedBy
+    ? await client.users.fetch(ticket.claimedBy).catch(() => null)
+    : null;
   const summary = new EmbedBuilder()
     .setColor(0xed4245)
     .setTitle(`Ticket #${ticket.id} closed`)
     .addFields(
       { name: "Opened by", value: opener ? `<@${opener.id}> (${opener.tag})` : ticket.userId, inline: true },
       { name: "Closed by", value: `<@${closer.id}> (${closer.tag})`, inline: true },
+      { name: "Claimed by", value: claimer ? `<@${claimer.id}> (${claimer.tag})` : "Unclaimed", inline: true },
       { name: "Channel", value: `#${channel.name}`, inline: true },
       { name: "Opened", value: `<t:${Math.floor(ticket.createdAt / 1000)}:f>`, inline: true },
       { name: "Closed", value: `<t:${Math.floor(ticket.closedAt / 1000)}:f>`, inline: true },
@@ -1089,6 +1140,7 @@ client.on("interactionCreate", async (interaction) => {
         if (action === "close") return handleTicketCloseButton(interaction);
         if (action === "close_confirm") return handleTicketCloseConfirm(interaction, id);
         if (action === "close_cancel") return handleTicketCloseCancel(interaction);
+        if (action === "claim") return handleTicketClaimButton(interaction);
       }
     }
   } catch (err) {
