@@ -16,6 +16,33 @@ const {
   MessageFlags,
 } = require("discord.js");
 
+const START_TIME = Date.now();
+let ownerId = null;
+
+function formatUptime(ms) {
+  const s = Math.floor(ms / 1000);
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  const parts = [];
+  if (d) parts.push(`${d}d`);
+  if (h) parts.push(`${h}h`);
+  if (m) parts.push(`${m}m`);
+  parts.push(`${sec}s`);
+  return parts.join(" ");
+}
+
+async function dmOwner(payload) {
+  if (!ownerId) return;
+  try {
+    const owner = await client.users.fetch(ownerId);
+    await owner.send(payload);
+  } catch (err) {
+    console.error("Failed to DM owner:", err.message);
+  }
+}
+
 // ---------- Roblox check config ----------
 const TARGETS = {
   follows: [
@@ -859,6 +886,11 @@ const ticketCommand = new SlashCommandBuilder()
   )
   .setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels);
 
+const statusCommand = new SlashCommandBuilder()
+  .setName("status")
+  .setDescription("Owner only: see bot health and uptime")
+  .setDMPermission(true);
+
 async function registerCommands() {
   const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_BOT_TOKEN);
   await rest.put(Routes.applicationCommands(client.user.id), {
@@ -868,9 +900,38 @@ async function registerCommands() {
       verifyCommand.toJSON(),
       cancelCommand.toJSON(),
       ticketCommand.toJSON(),
+      statusCommand.toJSON(),
     ],
   });
   console.log("Slash commands registered globally.");
+}
+
+async function handleStatus(interaction) {
+  if (!ownerId || interaction.user.id !== ownerId) {
+    return interaction.reply({
+      content: "This command is restricted to the bot owner.",
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+  const uptimeMs = Date.now() - START_TIME;
+  const mem = process.memoryUsage();
+  const memMb = (mem.rss / 1024 / 1024).toFixed(1);
+  const ping = Math.round(client.ws.ping);
+  const guilds = client.guilds.cache.size;
+  const embed = new EmbedBuilder()
+    .setColor(0x57f287)
+    .setTitle("Bot Status — Online")
+    .addFields(
+      { name: "Uptime", value: formatUptime(uptimeMs), inline: true },
+      { name: "Started", value: `<t:${Math.floor(START_TIME / 1000)}:R>`, inline: true },
+      { name: "Gateway ping", value: `${ping} ms`, inline: true },
+      { name: "Servers", value: String(guilds), inline: true },
+      { name: "Memory", value: `${memMb} MB`, inline: true },
+      { name: "Node", value: process.version, inline: true },
+    )
+    .setFooter({ text: "If this command stops responding, the bot is offline." })
+    .setTimestamp();
+  return interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
 }
 
 // ---------- Interaction handling ----------
@@ -1124,6 +1185,7 @@ client.on("interactionCreate", async (interaction) => {
         if (sub === "end") return handleGiveawayEnd(interaction);
         if (sub === "reroll") return handleGiveawayReroll(interaction);
       }
+      if (interaction.commandName === "status") return handleStatus(interaction);
       if (interaction.commandName === "ticket") {
         const sub = interaction.options.getSubcommand();
         if (sub === "setup") return handleTicketSetup(interaction);
@@ -1156,6 +1218,17 @@ client.on("interactionCreate", async (interaction) => {
 client.once("clientReady", async () => {
   console.log(`Logged in as ${client.user.tag}`);
   try {
+    const app = await client.application.fetch();
+    ownerId = app.owner?.ownerId || app.owner?.id || null;
+    if (app.owner?.members) {
+      const first = app.owner.members.first();
+      if (first) ownerId = first.id;
+    }
+    console.log(`Owner ID: ${ownerId}`);
+  } catch (err) {
+    console.error("Failed to fetch application owner:", err.message);
+  }
+  try {
     await registerCommands();
   } catch (err) {
     console.error("Failed to register slash commands:", err);
@@ -1163,7 +1236,45 @@ client.once("clientReady", async () => {
   for (const g of store.giveaways) {
     if (!g.ended) scheduleGiveaway(g);
   }
+  await dmOwner({
+    embeds: [
+      new EmbedBuilder()
+        .setColor(0x57f287)
+        .setTitle("✅ Bot is online")
+        .setDescription(
+          `Logged in as **${client.user.tag}**.\nUse \`/status\` any time to check health.`,
+        )
+        .addFields({ name: "Started", value: `<t:${Math.floor(START_TIME / 1000)}:F>`, inline: true })
+        .setTimestamp(),
+    ],
+  });
 });
+
+let shuttingDown = false;
+async function notifyShutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`Received ${signal}, notifying owner...`);
+  try {
+    await dmOwner({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(0xed4245)
+          .setTitle("⚠️ Bot is going offline")
+          .setDescription(
+            `Signal: \`${signal}\`\nUptime was **${formatUptime(Date.now() - START_TIME)}**.\nRestart the workflow (or redeploy) to bring it back online.`,
+          )
+          .setTimestamp(),
+      ],
+    });
+  } catch {}
+  try {
+    client.destroy();
+  } catch {}
+  process.exit(0);
+}
+process.on("SIGINT", () => notifyShutdown("SIGINT"));
+process.on("SIGTERM", () => notifyShutdown("SIGTERM"));
 
 const token = process.env.DISCORD_BOT_TOKEN;
 if (!token) {
