@@ -215,7 +215,7 @@ const checkCommand = new SlashCommandBuilder()
 const giveawayCommand = new SlashCommandBuilder()
   .setName("giveaway")
   .setDescription("Manage giveaways")
-  .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+  .setDefaultMemberPermissions(PermissionFlagsBits.ManageEvents)
   .addSubcommand((s) =>
     s
       .setName("start")

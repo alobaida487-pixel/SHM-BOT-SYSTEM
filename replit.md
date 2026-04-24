@@ -15,7 +15,7 @@ A small Discord bot that verifies whether a Roblox account follows a specific us
 - `/giveaway end id:<n>` — ends a giveaway immediately.
 - `/giveaway reroll id:<n>` — rerolls the winner of an already-ended giveaway.
 
-The `/giveaway` command requires the **Manage Server** permission.
+The `/giveaway` command requires the **Manage Events** permission.
 
 Slash commands are registered globally on startup. New global commands may take up to an hour to appear the first time.
 
