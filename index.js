@@ -286,12 +286,40 @@ function nextStepEmbed(code) {
     );
 }
 
-async function applyVerifiedNickname(guildId, userId, displayName, username) {
+const VERIFIED_ROLE_NAME = "Verified";
+
+async function applyVerification(guildId, userId, displayName, username) {
   const guild = await client.guilds.fetch(guildId);
   const member = await guild.members.fetch(userId);
   const desired = `${displayName} (@${username})`.slice(0, 32);
-  await member.setNickname(desired, "Roblox verification");
-  return desired;
+
+  const result = { nickname: null, nicknameError: null, role: null, roleError: null };
+
+  try {
+    await member.setNickname(desired, "Roblox verification");
+    result.nickname = desired;
+  } catch (err) {
+    result.nicknameError = err.message;
+  }
+
+  try {
+    await guild.roles.fetch();
+    const role = guild.roles.cache.find(
+      (r) => r.name.toLowerCase() === VERIFIED_ROLE_NAME.toLowerCase(),
+    );
+    if (!role) {
+      result.roleError = `No role named "${VERIFIED_ROLE_NAME}" exists in this server.`;
+    } else if (member.roles.cache.has(role.id)) {
+      result.role = role.name;
+    } else {
+      await member.roles.add(role, "Roblox verification");
+      result.role = role.name;
+    }
+  } catch (err) {
+    result.roleError = err.message;
+  }
+
+  return result;
 }
 
 // ---------- Slash command definitions ----------
@@ -572,21 +600,20 @@ async function handleDirectMessage(message) {
         ].join("\n"),
       );
     }
-    try {
-      const newNick = await applyVerifiedNickname(
-        session.guildId,
-        message.author.id,
-        session.robloxDisplayName,
-        session.robloxUsername,
-      );
-      clearVerification(message.author.id);
-      return message.reply(`Verified! Nickname set to **${newNick}**.`);
-    } catch (err) {
-      clearVerification(message.author.id);
-      return message.reply(
-        `Verified, but I couldn't update your nickname: ${err.message}. An admin may need to adjust my role position or grant Manage Nicknames.`,
-      );
-    }
+    const result = await applyVerification(
+      session.guildId,
+      message.author.id,
+      session.robloxDisplayName,
+      session.robloxUsername,
+    );
+    clearVerification(message.author.id);
+
+    const lines = ["Verified!"];
+    if (result.nickname) lines.push(`Nickname set to **${result.nickname}**.`);
+    else if (result.nicknameError) lines.push(`Couldn't update nickname: ${result.nicknameError}`);
+    if (result.role) lines.push(`Role **${result.role}** assigned.`);
+    else if (result.roleError) lines.push(`Couldn't assign verified role: ${result.roleError}`);
+    return message.reply(lines.join("\n"));
   }
 }
 
