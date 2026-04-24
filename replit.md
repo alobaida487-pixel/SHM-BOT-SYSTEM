@@ -17,6 +17,11 @@ A small Discord bot that verifies whether a Roblox account follows a specific us
 
 The `/giveaway` command requires the **Manage Events** permission.
 
+- `/verify` — starts Roblox verification in the user's DMs. The bot asks for their Roblox username, generates a random NATO-phonetic code, asks them to add it to their Roblox About Me, then verifies it and updates their server nickname to `DisplayName (@username)`.
+- `/cancel` (or just typing `cancel` in DMs) — aborts an in-progress verification.
+
+For nickname updates the bot needs the **Manage Nicknames** permission and a role placed above the verifying user's highest role. Verification sessions expire after 15 minutes of inactivity.
+
 Slash commands are registered globally on startup. New global commands may take up to an hour to appear the first time.
 
 ## Storage

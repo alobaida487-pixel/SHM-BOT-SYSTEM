@@ -3,6 +3,8 @@ const path = require("path");
 const {
   Client,
   GatewayIntentBits,
+  Partials,
+  ChannelType,
   EmbedBuilder,
   REST,
   Routes,
@@ -45,7 +47,14 @@ function getGiveaway(id) {
 }
 
 // ---------- Discord client ----------
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.DirectMessages,
+    GatewayIntentBits.MessageContent,
+  ],
+  partials: [Partials.Channel, Partials.Message],
+});
 
 // ---------- Roblox helpers ----------
 async function resolveRobloxUser(input) {
@@ -67,6 +76,12 @@ async function resolveRobloxUser(input) {
   if (!data.data || data.data.length === 0) return { error: "not_found" };
   const u = data.data[0];
   return { id: String(u.id), name: u.name, displayName: u.displayName };
+}
+async function getRobloxDescription(userId) {
+  const res = await fetch(`https://users.roblox.com/v1/users/${userId}`);
+  if (!res.ok) return { error: "api_error" };
+  const data = await res.json();
+  return { text: data.description || "" };
 }
 async function isInGroup(userId, groupId) {
   const res = await fetch(`https://groups.roblox.com/v2/users/${userId}/groups/roles`);
@@ -169,7 +184,7 @@ function enterRow(g, disabled = false) {
   );
 }
 
-// ---------- Ending logic ----------
+// ---------- Giveaway ending ----------
 async function endGiveaway(id) {
   const g = getGiveaway(id);
   if (!g || g.ended) return;
@@ -202,6 +217,81 @@ function scheduleGiveaway(g) {
     return;
   }
   setTimeout(() => endGiveaway(g.id), delay);
+}
+
+// ---------- Verification ----------
+const NATO = [
+  "alpha","bravo","charlie","delta","echo","foxtrot","golf","hotel","india",
+  "juliet","kilo","lima","mike","november","oscar","papa","quebec","romeo",
+  "sierra","tango","uniform","victor","whiskey","xray","yankee","zulu",
+];
+function generateCode() {
+  const out = [];
+  for (let i = 0; i < 5; i++) out.push(NATO[Math.floor(Math.random() * NATO.length)]);
+  return out.join(" ");
+}
+
+// userId -> session
+const verifications = new Map();
+const VERIFY_TIMEOUT_MS = 15 * 60 * 1000;
+
+function clearVerification(userId) {
+  const s = verifications.get(userId);
+  if (s?.timeout) clearTimeout(s.timeout);
+  verifications.delete(userId);
+}
+function startVerification(userId, guildId) {
+  clearVerification(userId);
+  const session = {
+    userId,
+    guildId,
+    state: "awaiting_username",
+    robloxUserId: null,
+    robloxUsername: null,
+    robloxDisplayName: null,
+    code: null,
+    timeout: setTimeout(() => {
+      const s = verifications.get(userId);
+      if (!s) return;
+      verifications.delete(userId);
+      client.users
+        .fetch(userId)
+        .then((u) => u.send("Verification timed out. Run `/verify` again to restart."))
+        .catch(() => {});
+    }, VERIFY_TIMEOUT_MS),
+  };
+  verifications.set(userId, session);
+  return session;
+}
+
+function verificationStartEmbed() {
+  return new EmbedBuilder()
+    .setColor(0x5865f2)
+    .setTitle("Verification")
+    .setDescription("Reply with your Roblox username. You can type `cancel` at any time to abort.");
+}
+function nextStepEmbed(code) {
+  return new EmbedBuilder()
+    .setColor(0x5865f2)
+    .setTitle("Next step")
+    .setDescription(
+      [
+        "Add this to your Roblox about me then reply `done`.",
+        "If you wish to stop, reply `cancel`.",
+        "",
+        "```",
+        code,
+        "```",
+      ].join("\n"),
+    );
+}
+
+async function applyVerifiedNickname(guildId, userId, displayName, username) {
+  const guild = await client.guilds.fetch(guildId);
+  const member = await guild.members.fetch(userId);
+  const desired = `${displayName} (@${username})`.slice(0, 32);
+  await member.setNickname(desired, "Roblox verification");
+  return desired;
 }
 
 // ---------- Slash command definitions ----------
@@ -248,12 +338,26 @@ const giveawayCommand = new SlashCommandBuilder()
       ),
   );
 
+const verifyCommand = new SlashCommandBuilder()
+  .setName("verify")
+  .setDescription("Verify your Roblox account via DM")
+  .setDMPermission(false);
+
+const cancelCommand = new SlashCommandBuilder()
+  .setName("cancel")
+  .setDescription("Cancel your in-progress Roblox verification");
+
 async function registerCommands() {
   const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_BOT_TOKEN);
   await rest.put(Routes.applicationCommands(client.user.id), {
-    body: [checkCommand.toJSON(), giveawayCommand.toJSON()],
+    body: [
+      checkCommand.toJSON(),
+      giveawayCommand.toJSON(),
+      verifyCommand.toJSON(),
+      cancelCommand.toJSON(),
+    ],
   });
-  console.log("Slash commands /check and /giveaway registered globally.");
+  console.log("Slash commands registered globally.");
 }
 
 // ---------- Interaction handling ----------
@@ -338,7 +442,6 @@ async function handleGiveawayStart(interaction) {
   saveData(store);
   scheduleGiveaway(g);
 }
-
 async function handleGiveawayEnd(interaction) {
   const id = interaction.options.getInteger("id", true);
   const g = getGiveaway(id);
@@ -349,7 +452,6 @@ async function handleGiveawayEnd(interaction) {
   await interaction.reply({ content: `Ending giveaway #${id}...`, flags: MessageFlags.Ephemeral });
   await endGiveaway(id);
 }
-
 async function handleGiveawayReroll(interaction) {
   const id = interaction.options.getInteger("id", true);
   const g = getGiveaway(id);
@@ -390,10 +492,120 @@ async function handleEnterButton(interaction, id) {
   await interaction.reply({ content: `🎉 You entered Giveaway #${g.id}! Good luck.`, flags: MessageFlags.Ephemeral });
 }
 
+async function handleVerify(interaction) {
+  if (!interaction.guildId) {
+    return interaction.reply({ content: "Run this command from a server.", flags: MessageFlags.Ephemeral });
+  }
+  try {
+    const dm = await interaction.user.createDM();
+    await dm.send({ embeds: [verificationStartEmbed()] });
+    startVerification(interaction.user.id, interaction.guildId);
+    await interaction.reply({ content: "Check your DMs to verify.", flags: MessageFlags.Ephemeral });
+  } catch (err) {
+    await interaction.reply({
+      content: "I couldn't DM you. Please enable DMs from server members and try again.",
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+}
+
+async function handleCancel(interaction) {
+  const had = verifications.has(interaction.user.id);
+  clearVerification(interaction.user.id);
+  if (had) {
+    try {
+      const dm = await interaction.user.createDM();
+      await dm.send("Verification cancelled.");
+    } catch {}
+    return interaction.reply({ content: "Verification cancelled.", flags: MessageFlags.Ephemeral });
+  }
+  return interaction.reply({
+    content: "You don't have an active verification to cancel.",
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
+// ---------- DM messages ----------
+async function handleDirectMessage(message) {
+  const session = verifications.get(message.author.id);
+  if (!session) return;
+  const content = (message.content || "").trim();
+  if (!content) return;
+
+  if (content.toLowerCase() === "cancel") {
+    clearVerification(message.author.id);
+    return message.reply("Verification cancelled.");
+  }
+
+  if (session.state === "awaiting_username") {
+    const user = await resolveRobloxUser(content);
+    if (user.error === "not_found") {
+      return message.reply("I couldn't find that Roblox user. Try again or type `cancel`.");
+    }
+    if (user.error) {
+      return message.reply("Roblox API error. Try again or type `cancel`.");
+    }
+    session.robloxUserId = user.id;
+    session.robloxUsername = user.name;
+    session.robloxDisplayName = user.displayName;
+    session.code = generateCode();
+    session.state = "awaiting_done";
+    return message.reply({ embeds: [nextStepEmbed(session.code)] });
+  }
+
+  if (session.state === "awaiting_done") {
+    if (content.toLowerCase() !== "done") {
+      return message.reply("Reply `done` once you've added the code, or `cancel` to abort.");
+    }
+    const desc = await getRobloxDescription(session.robloxUserId);
+    if (desc.error) {
+      return message.reply("Roblox API error reading your profile. Reply `done` to retry or `cancel` to abort.");
+    }
+    if (!desc.text.toLowerCase().includes(session.code.toLowerCase())) {
+      return message.reply(
+        [
+          "I couldn't find the code in your Roblox About Me. Make sure you added:",
+          "```",
+          session.code,
+          "```",
+          "Then reply `done` to try again, or `cancel` to abort.",
+        ].join("\n"),
+      );
+    }
+    try {
+      const newNick = await applyVerifiedNickname(
+        session.guildId,
+        message.author.id,
+        session.robloxDisplayName,
+        session.robloxUsername,
+      );
+      clearVerification(message.author.id);
+      return message.reply(`Verified! Nickname set to **${newNick}**.`);
+    } catch (err) {
+      clearVerification(message.author.id);
+      return message.reply(
+        `Verified, but I couldn't update your nickname: ${err.message}. An admin may need to adjust my role position or grant Manage Nicknames.`,
+      );
+    }
+  }
+}
+
+client.on("messageCreate", async (message) => {
+  if (message.author.bot) return;
+  if (message.channel.type !== ChannelType.DM) return;
+  try {
+    await handleDirectMessage(message);
+  } catch (err) {
+    console.error("DM handler error:", err);
+  }
+});
+
 client.on("interactionCreate", async (interaction) => {
   try {
     if (interaction.isChatInputCommand()) {
       if (interaction.commandName === "check") return handleCheck(interaction);
+      if (interaction.commandName === "verify") return handleVerify(interaction);
+      if (interaction.commandName === "cancel") return handleCancel(interaction);
       if (interaction.commandName === "giveaway") {
         const sub = interaction.options.getSubcommand();
         if (sub === "start") return handleGiveawayStart(interaction);
