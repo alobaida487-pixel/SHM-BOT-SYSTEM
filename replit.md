@@ -24,6 +24,21 @@ On successful verification the bot also assigns a role named **Verified** (case-
 
 Verification sessions expire after 15 minutes of inactivity.
 
+### Tickets
+
+- `/ticket setup category:<category> staff_role:<role> log_channel:<channel>` — one-time setup per server.
+- `/ticket panel [title] [description]` — posts a panel with a "Create Ticket" button in the current channel.
+- `/ticket close [reason]` — closes the current ticket (also available via the in-channel **Close Ticket** button with a confirmation step).
+- `/ticket add user:<user>` — adds a user to the current ticket (staff only).
+- `/ticket remove user:<user>` — removes a user from the current ticket (staff only).
+
+Ticket lifecycle:
+1. A user clicks the panel button → bot creates a private channel under the configured category, visible only to them, the staff role, and the bot.
+2. They chat with staff. Either side clicks **Close Ticket**.
+3. The bot generates an HTML transcript (via `discord-html-transcripts`), sends it with a summary embed to the configured log channel, DMs it to the ticket opener, then deletes the channel.
+
+The bot needs **Manage Channels** to create/delete ticket channels and **Attach Files** to post transcripts.
+
 Slash commands are registered globally on startup. New global commands may take up to an hour to appear the first time.
 
 ## Storage
