@@ -1,19 +1,20 @@
-const { Client, GatewayIntentBits, EmbedBuilder } = require("discord.js");
+const {
+  Client,
+  GatewayIntentBits,
+  EmbedBuilder,
+  REST,
+  Routes,
+  SlashCommandBuilder,
+  MessageFlags,
+} = require("discord.js");
 
 const TARGET_USER_ID = "9158302482";
 const TARGET_GROUP_ID = "351622539";
-const PREFIX = ".check";
 
 const TARGET_USER_URL = `https://www.roblox.com/users/${TARGET_USER_ID}/profile`;
 const TARGET_GROUP_URL = `https://www.roblox.com/communities/${TARGET_GROUP_ID}`;
 
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
-  ],
-});
+const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
 async function resolveRobloxUser(input) {
   const trimmed = String(input).trim().replace(/^@/, "");
@@ -63,47 +64,38 @@ async function isFollowing(userId, targetUserId) {
   return { following: false, truncated: true };
 }
 
-client.on("messageCreate", async (message) => {
-  if (message.author.bot) return;
-  const content = message.content.trim();
-  if (!content.toLowerCase().startsWith(PREFIX)) return;
+const checkCommand = new SlashCommandBuilder()
+  .setName("check")
+  .setDescription("Check if a Roblox account follows the target user and is in the target group.")
+  .addStringOption((opt) =>
+    opt
+      .setName("account")
+      .setDescription("Roblox username or user ID")
+      .setRequired(true)
+      .setMaxLength(50),
+  );
 
-  const args = content.slice(PREFIX.length).trim().split(/\s+/).filter(Boolean);
+async function registerCommands() {
+  const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_BOT_TOKEN);
+  await rest.put(Routes.applicationCommands(client.user.id), {
+    body: [checkCommand.toJSON()],
+  });
+  console.log("Slash command /check registered globally.");
+}
 
-  if (args.length === 0) {
-    const help = new EmbedBuilder()
-      .setColor(0x5865f2)
-      .setTitle("Roblox Check")
-      .setDescription(
-        [
-          "Usage: `.check <roblox_username_or_id>`",
-          "",
-          `Verifies the account follows [the target user](${TARGET_USER_URL}) and is in [the target group](${TARGET_GROUP_URL}).`,
-          "",
-          `**User ID:** [\`${TARGET_USER_ID}\`](${TARGET_USER_URL})`,
-          `**Group ID:** [\`${TARGET_GROUP_ID}\`](${TARGET_GROUP_URL})`,
-        ].join("\n"),
-      );
-    await message.reply({ embeds: [help] });
-    return;
-  }
+client.on("interactionCreate", async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
+  if (interaction.commandName !== "check") return;
 
-  const query = args.join(" ");
-  let working;
-  try {
-    working = await message.reply(`Checking \`${query}\`...`);
-  } catch {}
+  const query = interaction.options.getString("account", true).trim();
+  await interaction.deferReply();
 
   const user = await resolveRobloxUser(query);
   if (user.error === "not_found") {
-    const reply = `Could not find a Roblox user named \`${query}\`.`;
-    if (working) return working.edit(reply);
-    return message.reply(reply);
+    return interaction.editReply(`Could not find a Roblox user named \`${query}\`.`);
   }
   if (user.error) {
-    const reply = "Roblox API error while resolving the username. Please try again.";
-    if (working) return working.edit(reply);
-    return message.reply(reply);
+    return interaction.editReply("Roblox API error while resolving the username. Please try again.");
   }
 
   const [groupRes, followRes] = await Promise.all([
@@ -150,15 +142,16 @@ client.on("messageCreate", async (message) => {
     )
     .setFooter({ text: "Tip: tap the IDs above to copy on mobile." });
 
-  if (working) {
-    await working.edit({ content: null, embeds: [embed] });
-  } else {
-    await message.reply({ embeds: [embed] });
-  }
+  await interaction.editReply({ embeds: [embed] });
 });
 
-client.once("ready", () => {
+client.once("clientReady", async () => {
   console.log(`Logged in as ${client.user.tag}`);
+  try {
+    await registerCommands();
+  } catch (err) {
+    console.error("Failed to register slash commands:", err);
+  }
 });
 
 const token = process.env.DISCORD_BOT_TOKEN;
