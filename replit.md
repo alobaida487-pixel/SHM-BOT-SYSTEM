@@ -2,16 +2,26 @@
 
 A small Discord bot that verifies whether a Roblox account follows a specific user and is a member of a specific group.
 
-## Command
+## Commands
 
-- `/check account:<roblox_username_or_id>` — slash command that looks up the Roblox account and reports:
+- `/check account:<roblox_username_or_id>` — looks up the Roblox account and reports:
   - whether it follows Loosly (`9158302482`)
   - whether it follows Devsplaces (`6080558258`)
   - whether it is in group SHM (`351622539`)
 
-Each check is shown as a separate embed field with a ✅ Yes / ❌ No value.
+  Each check is shown as a separate embed field with a ✅ Yes / ❌ No value.
 
-The slash command is registered globally on startup. New global commands may take up to an hour to appear in clients the first time.
+- `/giveaway start prize:<text> duration:<e.g. 10m, 2h, 1d>` — posts a giveaway embed with an "Enter Giveaway" button. Auto-ends after the duration and edits the message into the "Ended" form with the winner.
+- `/giveaway end id:<n>` — ends a giveaway immediately.
+- `/giveaway reroll id:<n>` — rerolls the winner of an already-ended giveaway.
+
+The `/giveaway` command requires the **Manage Server** permission.
+
+Slash commands are registered globally on startup. New global commands may take up to an hour to appear the first time.
+
+## Storage
+
+Giveaways are persisted to `data/giveaways.json` so pending giveaways resume after a restart. The `data/` directory is gitignored.
 
 ## Tech
 
