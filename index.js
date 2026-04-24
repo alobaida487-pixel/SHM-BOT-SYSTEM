@@ -1,5 +1,6 @@
 const fs = require("fs");
 const path = require("path");
+const express = require("express");
 const {
   Client,
   GatewayIntentBits,
@@ -1275,6 +1276,32 @@ async function notifyShutdown(signal) {
 }
 process.on("SIGINT", () => notifyShutdown("SIGINT"));
 process.on("SIGTERM", () => notifyShutdown("SIGTERM"));
+
+// ---------- Keep-alive web server (for Render / UptimeRobot) ----------
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.get("/", (req, res) => {
+  const status = client.user
+    ? {
+        status: "online",
+        bot: client.user.tag,
+        uptime: formatUptime(Date.now() - START_TIME),
+        servers: client.guilds.cache.size,
+        ping_ms: Math.round(client.ws.ping),
+      }
+    : { status: "starting" };
+  res.json(status);
+});
+
+app.get("/health", (req, res) => {
+  if (client.user) res.status(200).send("OK");
+  else res.status(503).send("starting");
+});
+
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Keep-alive web server listening on port ${PORT}`);
+});
 
 const token = process.env.DISCORD_BOT_TOKEN;
 if (!token) {
