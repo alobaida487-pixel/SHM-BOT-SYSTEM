@@ -22,7 +22,7 @@ const TARGETS = {
     { name: "Loosly", id: "9158302482" },
     { name: "Devsplaces", id: "6080558258" },
   ],
-  group: { name: "SHM", id: "351622539" },
+  group: { name: "SHM", id: "273494562" },
 };
 
 // ---------- Persistence ----------
