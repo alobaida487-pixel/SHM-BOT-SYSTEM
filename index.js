@@ -804,10 +804,8 @@ async function handleTicketCloseSlash(interaction) {
     return interaction.reply({ content: "This isn't an open ticket channel.", flags: MessageFlags.Ephemeral });
   }
   const cfg = getTicketConfig(interaction.guildId);
-  const isOwner = interaction.user.id === ticket.userId;
-  const isStaff = await isStaffMember(interaction.guild, interaction.member, cfg);
-  if (!isOwner && !isStaff) {
-    return interaction.reply({ content: "You don't have permission to close this ticket.", flags: MessageFlags.Ephemeral });
+  if (!(await isStaffMember(interaction.guild, interaction.member, cfg))) {
+    return interaction.reply({ content: "Only staff can close tickets.", flags: MessageFlags.Ephemeral });
   }
   const reason = interaction.options.getString("reason") || null;
   await interaction.reply({ content: "Closing ticket and saving transcript..." });
@@ -943,10 +941,8 @@ async function handleTicketCloseButton(interaction) {
     return interaction.reply({ content: "This ticket is no longer open.", flags: MessageFlags.Ephemeral });
   }
   const cfg = getTicketConfig(interaction.guildId);
-  const isOwner = interaction.user.id === ticket.userId;
-  const isStaff = await isStaffMember(interaction.guild, interaction.member, cfg);
-  if (!isOwner && !isStaff) {
-    return interaction.reply({ content: "You can't close this ticket.", flags: MessageFlags.Ephemeral });
+  if (!(await isStaffMember(interaction.guild, interaction.member, cfg))) {
+    return interaction.reply({ content: "Only staff can close tickets.", flags: MessageFlags.Ephemeral });
   }
   await interaction.reply({
     content: "Are you sure you want to close this ticket?",
@@ -961,10 +957,8 @@ async function handleTicketCloseConfirm(interaction, ticketId) {
     return interaction.update({ content: "Ticket already closed.", components: [] });
   }
   const cfg = getTicketConfig(interaction.guildId);
-  const isOwner = interaction.user.id === ticket.userId;
-  const isStaff = await isStaffMember(interaction.guild, interaction.member, cfg);
-  if (!isOwner && !isStaff) {
-    return interaction.reply({ content: "You can't close this ticket.", flags: MessageFlags.Ephemeral });
+  if (!(await isStaffMember(interaction.guild, interaction.member, cfg))) {
+    return interaction.reply({ content: "Only staff can close tickets.", flags: MessageFlags.Ephemeral });
   }
   await interaction.update({ content: "Closing ticket and saving transcript...", components: [] });
   const channel = await client.channels.fetch(ticket.channelId);
