@@ -770,18 +770,21 @@ async function handleTicketMenuAdd(interaction) {
 async function handleTicketMenuRemove(interaction) {
   const list = store.ticketMenus[interaction.guildId];
   if (!Array.isArray(list) || !list.length) {
-    return interaction.reply({ content: "You haven't added any custom menu options yet.", flags: MessageFlags.Ephemeral });
+    return interaction.reply({ content: "You haven't added any custom menu options yet. Add some with `/ticket menu add` first.", flags: MessageFlags.Ephemeral });
   }
-  const choice = interaction.options.getString("option", true);
-  const idx = list.findIndex((c) => c.value === choice);
-  if (idx === -1) {
-    return interaction.reply({ content: "That option isn't in your menu.", flags: MessageFlags.Ephemeral });
+  const number = interaction.options.getInteger("number", true);
+  const idx = number - 1;
+  if (idx < 0 || idx >= list.length) {
+    return interaction.reply({
+      content: `That number doesn't exist. You currently have **${list.length}** option${list.length === 1 ? "" : "s"} (use \`/ticket menu list\` to see them).`,
+      flags: MessageFlags.Ephemeral,
+    });
   }
   const removed = list.splice(idx, 1)[0];
   store.ticketMenus[interaction.guildId] = list;
   saveData(store);
   return interaction.reply({
-    content: `Removed **${removed.emoji} ${removed.label}** from the menu. Re-post the panel with \`/ticket panel\`.`,
+    content: `Removed **${removed.emoji} ${removed.label}** (option #${number}) from the menu. Re-post the panel with \`/ticket panel\`.`,
     flags: MessageFlags.Ephemeral,
   });
 }
@@ -1088,8 +1091,15 @@ const ticketCommand = new SlashCommandBuilder()
       .addSubcommand((s) =>
         s
           .setName("remove")
-          .setDescription("Remove a menu option by its value")
-          .addStringOption((o) => o.setName("option").setDescription("The option's value (see /ticket menu list)").setRequired(true)),
+          .setDescription("Remove a menu option by its number")
+          .addIntegerOption((o) =>
+            o
+              .setName("number")
+              .setDescription("The option's number from /ticket menu list (1, 2, 3, …)")
+              .setRequired(true)
+              .setMinValue(1)
+              .setMaxValue(25),
+          ),
       )
       .addSubcommand((s) => s.setName("reset").setDescription("Reset the menu back to defaults")),
   )
