@@ -658,12 +658,21 @@ async function finalizeTicketClose(ticket, channel, closer, reason) {
   const logPayload = { embeds: [summary] };
   if (attachment) logPayload.files = [attachment];
 
-  if (cfg?.logChannelId) {
+  let logStatus = "skipped";
+  let logError = null;
+  if (!cfg?.logChannelId) {
+    logStatus = "no_channel";
+    console.warn(`[ticket #${ticket.id}] No log channel configured for guild ${ticket.guildId}. Run /ticket setup.`);
+  } else {
     try {
       const logCh = await client.channels.fetch(cfg.logChannelId);
       await logCh.send(logPayload);
+      logStatus = "sent";
+      console.log(`[ticket #${ticket.id}] Transcript sent to #${logCh.name}`);
     } catch (err) {
-      console.error("Failed to send transcript to log channel:", err.message);
+      logStatus = "failed";
+      logError = err.message;
+      console.error(`[ticket #${ticket.id}] Failed to send transcript to log channel ${cfg.logChannelId}:`, err.message);
     }
   }
 
@@ -676,6 +685,24 @@ async function finalizeTicketClose(ticket, channel, closer, reason) {
       });
     } catch {}
   }
+
+  return { logStatus, logError };
+}
+
+async function notifyCloserOfLogIssue(closer, ticket, result) {
+  if (result.logStatus === "sent") return;
+  let msg;
+  if (result.logStatus === "no_channel") {
+    msg = `Heads up: ticket #${ticket.id} closed, but **no log channel is set** for this server. An admin should run \`/ticket setup\` to pick one.`;
+  } else if (result.logStatus === "failed") {
+    msg = `Heads up: ticket #${ticket.id} closed, but I couldn't post the transcript to the log channel. Reason: \`${result.logError}\`. Check that I can see the channel and have **Send Messages**, **Embed Links**, and **Attach Files** there.`;
+  } else {
+    return;
+  }
+  try {
+    const dm = await closer.createDM();
+    await dm.send(msg);
+  } catch {}
 }
 
 async function handleTicketSetup(interaction) {
@@ -809,7 +836,8 @@ async function handleTicketCloseSlash(interaction) {
   }
   const reason = interaction.options.getString("reason") || null;
   await interaction.reply({ content: "Closing ticket and saving transcript..." });
-  await finalizeTicketClose(ticket, interaction.channel, interaction.user, reason);
+  const result = await finalizeTicketClose(ticket, interaction.channel, interaction.user, reason);
+  await notifyCloserOfLogIssue(interaction.user, ticket, result);
   setTimeout(() => interaction.channel.delete().catch(() => {}), 4000);
 }
 
@@ -987,7 +1015,8 @@ async function handleTicketCloseConfirm(interaction, ticketId) {
   }
   await interaction.update({ content: "Closing ticket and saving transcript...", components: [] });
   const channel = await client.channels.fetch(ticket.channelId);
-  await finalizeTicketClose(ticket, channel, interaction.user, null);
+  const result = await finalizeTicketClose(ticket, channel, interaction.user, null);
+  await notifyCloserOfLogIssue(interaction.user, ticket, result);
   setTimeout(() => channel.delete().catch(() => {}), 4000);
 }
 
