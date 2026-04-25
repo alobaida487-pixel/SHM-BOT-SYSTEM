@@ -833,6 +833,31 @@ async function handleTicketAdd(interaction) {
   await interaction.reply(`Added <@${user.id}> to the ticket.`);
 }
 
+async function handleTicketRename(interaction) {
+  const ticket = getTicketByChannel(interaction.channelId);
+  if (!ticket || ticket.closed) {
+    return interaction.reply({ content: "This isn't an open ticket channel.", flags: MessageFlags.Ephemeral });
+  }
+  const cfg = getTicketConfig(interaction.guildId);
+  if (!(await isStaffMember(interaction.guild, interaction.member, cfg))) {
+    return interaction.reply({ content: "Only staff can rename tickets.", flags: MessageFlags.Ephemeral });
+  }
+  const raw = interaction.options.getString("name", true);
+  const newName = slugify(raw);
+  if (!newName) {
+    return interaction.reply({ content: "That name has no usable characters. Try letters, numbers, or dashes.", flags: MessageFlags.Ephemeral });
+  }
+  const oldName = interaction.channel.name;
+  await interaction.deferReply();
+  try {
+    await interaction.channel.setName(newName, `Renamed by ${interaction.user.tag}`);
+    await interaction.editReply(`Channel renamed: \`${oldName}\` → \`${interaction.channel.name}\``);
+  } catch (err) {
+    console.error("Ticket rename failed:", err);
+    await interaction.editReply(`Couldn't rename the channel: ${err.message}\n(Discord limits channel renames to **2 times every 10 minutes**.)`);
+  }
+}
+
 async function handleTicketRemove(interaction) {
   const ticket = getTicketByChannel(interaction.channelId);
   if (!ticket || ticket.closed) {
@@ -1065,6 +1090,18 @@ const ticketCommand = new SlashCommandBuilder()
       .setName("remove")
       .setDescription("Remove a user from the current ticket")
       .addUserOption((o) => o.setName("user").setDescription("User to remove").setRequired(true)),
+  )
+  .addSubcommand((s) =>
+    s
+      .setName("rename")
+      .setDescription("Rename the current ticket channel (staff only)")
+      .addStringOption((o) =>
+        o
+          .setName("name")
+          .setDescription("New channel name (letters, numbers, dashes)")
+          .setRequired(true)
+          .setMaxLength(80),
+      ),
   )
   .addSubcommand((s) =>
     s.setName("stats").setDescription("Show ticket statistics for this server"),
@@ -1413,6 +1450,7 @@ client.on("interactionCreate", async (interaction) => {
         if (sub === "close") return handleTicketCloseSlash(interaction);
         if (sub === "add") return handleTicketAdd(interaction);
         if (sub === "remove") return handleTicketRemove(interaction);
+        if (sub === "rename") return handleTicketRename(interaction);
         if (sub === "stats") return handleTicketStats(interaction);
       }
     } else if (interaction.isStringSelectMenu()) {
