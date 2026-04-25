@@ -13,9 +13,21 @@ const {
   ButtonBuilder,
   ButtonStyle,
   ActionRowBuilder,
+  StringSelectMenuBuilder,
+  StringSelectMenuOptionBuilder,
   PermissionFlagsBits,
   MessageFlags,
 } = require("discord.js");
+
+const TICKET_CATEGORIES = [
+  { value: "support",  label: "General Support", description: "Help with the server or game", emoji: "🛠️" },
+  { value: "report",   label: "Report a User",   description: "Report rule-breaking behavior", emoji: "🚨" },
+  { value: "purchase", label: "Purchase / Buy",  description: "Buying products or services",   emoji: "💰" },
+  { value: "other",    label: "Other",           description: "Anything else",                  emoji: "❓" },
+];
+function getCategory(value) {
+  return TICKET_CATEGORIES.find((c) => c.value === value) || TICKET_CATEGORIES[0];
+}
 
 const START_TIME = Date.now();
 let ownerId = null;
@@ -386,27 +398,39 @@ function getOpenTicketByUser(guildId, userId) {
 }
 
 function ticketPanelEmbed(opts = {}) {
+  const lines = TICKET_CATEGORIES.map(
+    (c) => `${c.emoji} **${c.label}** — ${c.description}`,
+  ).join("\n");
   return new EmbedBuilder()
     .setColor(0x5865f2)
     .setTitle(opts.title || "Support Tickets")
     .setDescription(
-      opts.description ||
-        "Need help? Click the button below to open a private ticket. A staff member will be with you shortly.",
+      (opts.description ||
+        "Need help? Pick a category from the menu below to open a private ticket. A staff member will be with you shortly.") +
+        "\n\n" + lines,
     );
 }
 function ticketPanelRow() {
-  return new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId("ticket:create")
-      .setLabel("Create Ticket")
-      .setEmoji("🎫")
-      .setStyle(ButtonStyle.Primary),
-  );
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId("ticket:create")
+    .setPlaceholder("Select a ticket category…")
+    .setMinValues(1)
+    .setMaxValues(1)
+    .addOptions(
+      TICKET_CATEGORIES.map((c) =>
+        new StringSelectMenuOptionBuilder()
+          .setLabel(c.label)
+          .setValue(c.value)
+          .setDescription(c.description)
+          .setEmoji(c.emoji),
+      ),
+    );
+  return new ActionRowBuilder().addComponents(menu);
 }
 function ticketWelcomeEmbed(ticket, owner) {
   return new EmbedBuilder()
     .setColor(0x5865f2)
-    .setTitle(`Ticket #${ticket.id}`)
+    .setTitle(`Ticket #${ticket.id} • ${getCategory(ticket.category).emoji} ${getCategory(ticket.category).label}`)
     .setDescription(
       `Hello <@${owner.id}>, support will be with you shortly.\nDescribe your issue here. When you're done, click **Close Ticket** below.`,
     )
@@ -445,11 +469,12 @@ async function isStaffMember(guild, member, cfg) {
   return false;
 }
 
-async function createTicketChannel(interaction, cfg) {
+async function createTicketChannel(interaction, cfg, categoryValue = "support") {
   const guild = interaction.guild;
+  const category = getCategory(categoryValue);
   store.ticketCounter += 1;
   const ticketId = store.ticketCounter;
-  const baseName = `ticket-${interaction.user.username}`
+  const baseName = `${category.value}-${interaction.user.username}`
     .toLowerCase()
     .replace(/[^a-z0-9-]/g, "")
     .slice(0, 90) || `ticket-${ticketId}`;
@@ -509,6 +534,7 @@ async function createTicketChannel(interaction, cfg) {
     guildId: guild.id,
     channelId: channel.id,
     userId: interaction.user.id,
+    category: category.value,
     createdAt: Date.now(),
     closed: false,
     closedBy: null,
@@ -728,7 +754,7 @@ async function handleTicketRemove(interaction) {
   await interaction.reply(`Removed <@${user.id}> from the ticket.`);
 }
 
-async function handleTicketCreateButton(interaction) {
+async function handleTicketCreateSelect(interaction) {
   const cfg = getTicketConfig(interaction.guildId);
   if (!cfg) {
     return interaction.reply({ content: "Tickets aren't configured. Ask an admin to run `/ticket setup`.", flags: MessageFlags.Ephemeral });
@@ -740,14 +766,70 @@ async function handleTicketCreateButton(interaction) {
       flags: MessageFlags.Ephemeral,
     });
   }
+  const categoryValue = interaction.values?.[0] || "support";
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
   try {
-    const { ticket, channel } = await createTicketChannel(interaction, cfg);
-    await interaction.editReply(`Ticket created: <#${channel.id}> (Ticket #${ticket.id})`);
+    const { ticket, channel } = await createTicketChannel(interaction, cfg, categoryValue);
+    await interaction.editReply(`Ticket created: <#${channel.id}> (Ticket #${ticket.id} • ${getCategory(categoryValue).label})`);
   } catch (err) {
     console.error("Ticket creation failed:", err);
     await interaction.editReply(`Failed to create ticket: ${err.message}`);
   }
+}
+
+async function handleTicketStats(interaction) {
+  const guildTickets = store.tickets.filter((t) => t.guildId === interaction.guildId);
+  const total = guildTickets.length;
+  const open = guildTickets.filter((t) => !t.closed).length;
+  const closed = guildTickets.filter((t) => t.closed).length;
+  const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+  const last7d = guildTickets.filter((t) => t.createdAt >= sevenDaysAgo).length;
+
+  const closedWithTimes = guildTickets.filter((t) => t.closed && t.closedAt);
+  let avgResMs = 0;
+  if (closedWithTimes.length) {
+    avgResMs =
+      closedWithTimes.reduce((sum, t) => sum + (t.closedAt - t.createdAt), 0) /
+      closedWithTimes.length;
+  }
+  const avgResStr = closedWithTimes.length ? formatUptime(avgResMs) : "—";
+
+  const catCounts = {};
+  for (const t of guildTickets) {
+    const v = t.category || "support";
+    catCounts[v] = (catCounts[v] || 0) + 1;
+  }
+  const catLines = TICKET_CATEGORIES.map((c) => {
+    const n = catCounts[c.value] || 0;
+    return `${c.emoji} **${c.label}** — ${n}`;
+  }).join("\n");
+
+  const claimerCounts = {};
+  for (const t of guildTickets) {
+    if (t.claimedBy) claimerCounts[t.claimedBy] = (claimerCounts[t.claimedBy] || 0) + 1;
+  }
+  const topClaimers = Object.entries(claimerCounts)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5)
+    .map(([uid, n], i) => `${i + 1}. <@${uid}> — ${n}`)
+    .join("\n") || "No claims yet.";
+
+  const embed = new EmbedBuilder()
+    .setColor(0x5865f2)
+    .setTitle("Ticket Statistics")
+    .addFields(
+      { name: "Total tickets", value: String(total), inline: true },
+      { name: "Open", value: String(open), inline: true },
+      { name: "Closed", value: String(closed), inline: true },
+      { name: "Last 7 days", value: String(last7d), inline: true },
+      { name: "Avg resolution time", value: avgResStr, inline: true },
+      { name: "Claimed (closed)", value: String(closedWithTimes.filter((t) => t.claimedBy).length), inline: true },
+      { name: "By category", value: catLines || "—", inline: false },
+      { name: "Top claimers", value: topClaimers, inline: false },
+    )
+    .setFooter({ text: `Server: ${interaction.guild.name}` })
+    .setTimestamp();
+  return interaction.reply({ embeds: [embed], allowedMentions: { parse: [] } });
 }
 
 async function handleTicketCloseButton(interaction) {
@@ -884,6 +966,9 @@ const ticketCommand = new SlashCommandBuilder()
       .setName("remove")
       .setDescription("Remove a user from the current ticket")
       .addUserOption((o) => o.setName("user").setDescription("User to remove").setRequired(true)),
+  )
+  .addSubcommand((s) =>
+    s.setName("stats").setDescription("Show ticket statistics for this server"),
   )
   .setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels);
 
@@ -1194,12 +1279,15 @@ client.on("interactionCreate", async (interaction) => {
         if (sub === "close") return handleTicketCloseSlash(interaction);
         if (sub === "add") return handleTicketAdd(interaction);
         if (sub === "remove") return handleTicketRemove(interaction);
+        if (sub === "stats") return handleTicketStats(interaction);
       }
+    } else if (interaction.isStringSelectMenu()) {
+      const [ns, action] = interaction.customId.split(":");
+      if (ns === "ticket" && action === "create") return handleTicketCreateSelect(interaction);
     } else if (interaction.isButton()) {
       const [ns, action, id] = interaction.customId.split(":");
       if (ns === "giveaway" && action === "enter") return handleEnterButton(interaction, id);
       if (ns === "ticket") {
-        if (action === "create") return handleTicketCreateButton(interaction);
         if (action === "close") return handleTicketCloseButton(interaction);
         if (action === "close_confirm") return handleTicketCloseConfirm(interaction, id);
         if (action === "close_cancel") return handleTicketCloseCancel(interaction);
