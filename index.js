@@ -75,6 +75,7 @@ function defaultData() {
     giveaways: [],
     ticketCounter: 0,
     ticketConfig: {},
+    ticketMenus: {},
     tickets: [],
   };
 }
@@ -388,6 +389,22 @@ async function getTranscripts() {
 function getTicketConfig(guildId) {
   return store.ticketConfig[guildId] || null;
 }
+function getGuildCategories(guildId) {
+  const list = store.ticketMenus?.[guildId];
+  if (Array.isArray(list) && list.length) return list;
+  return TICKET_CATEGORIES;
+}
+function getCategoryFor(guildId, value) {
+  const list = getGuildCategories(guildId);
+  return list.find((c) => c.value === value) || list[0] || TICKET_CATEGORIES[0];
+}
+function slugify(s) {
+  return s
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 50) || "ticket";
+}
 function getTicketByChannel(channelId) {
   return store.tickets.find((t) => t.channelId === channelId);
 }
@@ -397,10 +414,10 @@ function getOpenTicketByUser(guildId, userId) {
   );
 }
 
-function ticketPanelEmbed(opts = {}) {
-  const lines = TICKET_CATEGORIES.map(
-    (c) => `${c.emoji} **${c.label}** — ${c.description}`,
-  ).join("\n");
+function ticketPanelEmbed(categories, opts = {}) {
+  const lines = categories
+    .map((c) => `${c.emoji} **${c.label}** — ${c.description}`)
+    .join("\n");
   return new EmbedBuilder()
     .setColor(0x5865f2)
     .setTitle(opts.title || "Support Tickets")
@@ -410,27 +427,28 @@ function ticketPanelEmbed(opts = {}) {
         "\n\n" + lines,
     );
 }
-function ticketPanelRow() {
+function ticketPanelRow(categories) {
   const menu = new StringSelectMenuBuilder()
     .setCustomId("ticket:create")
     .setPlaceholder("Select a ticket category…")
     .setMinValues(1)
     .setMaxValues(1)
     .addOptions(
-      TICKET_CATEGORIES.map((c) =>
+      categories.slice(0, 25).map((c) =>
         new StringSelectMenuOptionBuilder()
           .setLabel(c.label)
           .setValue(c.value)
-          .setDescription(c.description)
+          .setDescription(c.description || " ")
           .setEmoji(c.emoji),
       ),
     );
   return new ActionRowBuilder().addComponents(menu);
 }
 function ticketWelcomeEmbed(ticket, owner) {
+  const cat = getCategoryFor(ticket.guildId, ticket.category);
   return new EmbedBuilder()
     .setColor(0x5865f2)
-    .setTitle(`Ticket #${ticket.id} • ${getCategory(ticket.category).emoji} ${getCategory(ticket.category).label}`)
+    .setTitle(`Ticket #${ticket.id} • ${cat.emoji} ${cat.label}`)
     .setDescription(
       `Hello <@${owner.id}>, support will be with you shortly.\nDescribe your issue here. When you're done, click **Close Ticket** below.`,
     )
@@ -471,7 +489,7 @@ async function isStaffMember(guild, member, cfg) {
 
 async function createTicketChannel(interaction, cfg, categoryValue = "support") {
   const guild = interaction.guild;
-  const category = getCategory(categoryValue);
+  const category = getCategoryFor(guild.id, categoryValue);
   store.ticketCounter += 1;
   const ticketId = store.ticketCounter;
   const baseName = `${category.value}-${interaction.user.username}`
@@ -691,12 +709,89 @@ async function handleTicketPanel(interaction) {
   if (!cfg) {
     return interaction.reply({ content: "Run `/ticket setup` first.", flags: MessageFlags.Ephemeral });
   }
+  const categories = getGuildCategories(interaction.guildId);
+  if (!categories.length) {
+    return interaction.reply({
+      content: "No menu options are set. Add some with `/ticket menu add` or run `/ticket menu reset`.",
+      flags: MessageFlags.Ephemeral,
+    });
+  }
   const title = interaction.options.getString("title");
   const description = interaction.options.getString("description");
   await interaction.reply({ content: "Panel posted.", flags: MessageFlags.Ephemeral });
   await interaction.channel.send({
-    embeds: [ticketPanelEmbed({ title, description })],
-    components: [ticketPanelRow()],
+    embeds: [ticketPanelEmbed(categories, { title, description })],
+    components: [ticketPanelRow(categories)],
+  });
+}
+
+async function handleTicketMenuList(interaction) {
+  const categories = getGuildCategories(interaction.guildId);
+  const isCustom = Array.isArray(store.ticketMenus[interaction.guildId]) && store.ticketMenus[interaction.guildId].length;
+  const lines = categories.length
+    ? categories.map((c, i) => `${i + 1}. ${c.emoji} **${c.label}** — ${c.description}  \`(${c.value})\``).join("\n")
+    : "No menu options set.";
+  const embed = new EmbedBuilder()
+    .setColor(0x5865f2)
+    .setTitle(`Ticket menu options${isCustom ? "" : " (defaults)"}`)
+    .setDescription(lines)
+    .setFooter({ text: "Add: /ticket menu add  •  Remove: /ticket menu remove  •  Clear: /ticket menu reset" });
+  return interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
+}
+
+async function handleTicketMenuAdd(interaction) {
+  const label = interaction.options.getString("label", true).trim();
+  const description = (interaction.options.getString("description") || " ").trim().slice(0, 100);
+  const emoji = (interaction.options.getString("emoji") || "🎫").trim();
+
+  const current = Array.isArray(store.ticketMenus[interaction.guildId])
+    ? [...store.ticketMenus[interaction.guildId]]
+    : [];
+  if (current.length >= 25) {
+    return interaction.reply({ content: "You already have 25 menu options (Discord's max).", flags: MessageFlags.Ephemeral });
+  }
+
+  let value = slugify(label);
+  let suffix = 2;
+  while (current.some((c) => c.value === value)) {
+    value = `${slugify(label)}-${suffix++}`;
+  }
+
+  current.push({ value, label: label.slice(0, 80), description, emoji });
+  store.ticketMenus[interaction.guildId] = current;
+  saveData(store);
+
+  return interaction.reply({
+    content: `Added **${emoji} ${label}** to the menu. Re-post the panel with \`/ticket panel\` so members see it.`,
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
+async function handleTicketMenuRemove(interaction) {
+  const list = store.ticketMenus[interaction.guildId];
+  if (!Array.isArray(list) || !list.length) {
+    return interaction.reply({ content: "You haven't added any custom menu options yet.", flags: MessageFlags.Ephemeral });
+  }
+  const choice = interaction.options.getString("option", true);
+  const idx = list.findIndex((c) => c.value === choice);
+  if (idx === -1) {
+    return interaction.reply({ content: "That option isn't in your menu.", flags: MessageFlags.Ephemeral });
+  }
+  const removed = list.splice(idx, 1)[0];
+  store.ticketMenus[interaction.guildId] = list;
+  saveData(store);
+  return interaction.reply({
+    content: `Removed **${removed.emoji} ${removed.label}** from the menu. Re-post the panel with \`/ticket panel\`.`,
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
+async function handleTicketMenuReset(interaction) {
+  delete store.ticketMenus[interaction.guildId];
+  saveData(store);
+  return interaction.reply({
+    content: "Menu cleared. The panel will now use the **default** options (Support / Report / Purchase / Other) until you add new ones with `/ticket menu add`.",
+    flags: MessageFlags.Ephemeral,
   });
 }
 
@@ -766,11 +861,12 @@ async function handleTicketCreateSelect(interaction) {
       flags: MessageFlags.Ephemeral,
     });
   }
-  const categoryValue = interaction.values?.[0] || "support";
+  const categoryValue = interaction.values?.[0] || getGuildCategories(interaction.guildId)[0]?.value;
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
   try {
     const { ticket, channel } = await createTicketChannel(interaction, cfg, categoryValue);
-    await interaction.editReply(`Ticket created: <#${channel.id}> (Ticket #${ticket.id} • ${getCategory(categoryValue).label})`);
+    const catLabel = getCategoryFor(interaction.guildId, categoryValue).label;
+    await interaction.editReply(`Ticket created: <#${channel.id}> (Ticket #${ticket.id} • ${catLabel})`);
   } catch (err) {
     console.error("Ticket creation failed:", err);
     await interaction.editReply(`Failed to create ticket: ${err.message}`);
@@ -799,10 +895,16 @@ async function handleTicketStats(interaction) {
     const v = t.category || "support";
     catCounts[v] = (catCounts[v] || 0) + 1;
   }
-  const catLines = TICKET_CATEGORIES.map((c) => {
+  const guildCats = getGuildCategories(interaction.guildId);
+  const knownValues = new Set(guildCats.map((c) => c.value));
+  const knownLines = guildCats.map((c) => {
     const n = catCounts[c.value] || 0;
     return `${c.emoji} **${c.label}** — ${n}`;
-  }).join("\n");
+  });
+  const legacyLines = Object.entries(catCounts)
+    .filter(([v]) => !knownValues.has(v))
+    .map(([v, n]) => `• \`${v}\` — ${n}`);
+  const catLines = [...knownLines, ...legacyLines].join("\n") || "—";
 
   const claimerCounts = {};
   for (const t of guildTickets) {
@@ -969,6 +1071,27 @@ const ticketCommand = new SlashCommandBuilder()
   )
   .addSubcommand((s) =>
     s.setName("stats").setDescription("Show ticket statistics for this server"),
+  )
+  .addSubcommandGroup((g) =>
+    g
+      .setName("menu")
+      .setDescription("Manage the ticket panel menu options")
+      .addSubcommand((s) => s.setName("list").setDescription("List the current menu options"))
+      .addSubcommand((s) =>
+        s
+          .setName("add")
+          .setDescription("Add a new option to the ticket menu")
+          .addStringOption((o) => o.setName("label").setDescription("Option name shown in the menu").setRequired(true).setMaxLength(80))
+          .addStringOption((o) => o.setName("description").setDescription("Short description below the label").setMaxLength(100))
+          .addStringOption((o) => o.setName("emoji").setDescription("A single emoji (default: 🎫)")),
+      )
+      .addSubcommand((s) =>
+        s
+          .setName("remove")
+          .setDescription("Remove a menu option by its value")
+          .addStringOption((o) => o.setName("option").setDescription("The option's value (see /ticket menu list)").setRequired(true)),
+      )
+      .addSubcommand((s) => s.setName("reset").setDescription("Reset the menu back to defaults")),
   )
   .setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels);
 
@@ -1273,7 +1396,14 @@ client.on("interactionCreate", async (interaction) => {
       }
       if (interaction.commandName === "status") return handleStatus(interaction);
       if (interaction.commandName === "ticket") {
+        const group = interaction.options.getSubcommandGroup(false);
         const sub = interaction.options.getSubcommand();
+        if (group === "menu") {
+          if (sub === "list") return handleTicketMenuList(interaction);
+          if (sub === "add") return handleTicketMenuAdd(interaction);
+          if (sub === "remove") return handleTicketMenuRemove(interaction);
+          if (sub === "reset") return handleTicketMenuReset(interaction);
+        }
         if (sub === "setup") return handleTicketSetup(interaction);
         if (sub === "panel") return handleTicketPanel(interaction);
         if (sub === "close") return handleTicketCloseSlash(interaction);
