@@ -77,6 +77,8 @@ function defaultData() {
     ticketConfig: {},
     ticketMenus: {},
     tickets: [],
+    warns: {},
+    warnCounter: 0,
   };
 }
 function loadData() {
@@ -101,6 +103,8 @@ function getGiveaway(id) {
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.GuildMembers,
     GatewayIntentBits.DirectMessages,
     GatewayIntentBits.MessageContent,
   ],
@@ -1024,6 +1028,459 @@ async function handleTicketCloseCancel(interaction) {
   await interaction.update({ content: "Close cancelled.", components: [] });
 }
 
+// ---------- Moderation ----------
+const PREFIX = "?";
+
+function parseDuration(str) {
+  if (!str) return null;
+  const m = String(str).trim().match(/^(\d+)\s*(s|m|h|d|w)?$/i);
+  if (!m) return null;
+  const n = parseInt(m[1], 10);
+  if (!n) return null;
+  const unit = (m[2] || "m").toLowerCase();
+  const mult = { s: 1000, m: 60000, h: 3600000, d: 86400000, w: 604800000 }[unit];
+  return n * mult;
+}
+function formatDuration(ms) {
+  if (ms < 60000) return `${Math.round(ms / 1000)}s`;
+  if (ms < 3600000) return `${Math.round(ms / 60000)}m`;
+  if (ms < 86400000) return `${Math.round(ms / 3600000)}h`;
+  return `${Math.round(ms / 86400000)}d`;
+}
+function extractId(input) {
+  if (!input) return null;
+  const m = String(input).match(/^<@!?(\d+)>$|^(\d+)$/);
+  return m ? (m[1] || m[2]) : null;
+}
+async function resolveUser(input) {
+  const id = extractId(input);
+  if (!id) return null;
+  return client.users.fetch(id).catch(() => null);
+}
+async function resolveMember(guild, input) {
+  const id = extractId(input);
+  if (!id) return null;
+  return guild.members.fetch(id).catch(() => null);
+}
+function canModerate(moderator, target) {
+  if (!target) return { ok: true };
+  if (target.id === moderator.id) return { ok: false, reason: "You can't moderate yourself." };
+  if (target.id === moderator.guild.ownerId) return { ok: false, reason: "You can't moderate the server owner." };
+  if (target.user?.bot && target.id === client.user.id) return { ok: false, reason: "I can't moderate myself." };
+  if (moderator.id !== moderator.guild.ownerId) {
+    if (moderator.roles.highest.position <= target.roles.highest.position) {
+      return { ok: false, reason: "You can't moderate someone with an equal or higher role than you." };
+    }
+  }
+  const me = target.guild.members.me;
+  if (me && me.roles.highest.position <= target.roles.highest.position) {
+    return { ok: false, reason: "I can't act on this user — my role is below theirs. Move my role higher." };
+  }
+  return { ok: true };
+}
+function modLogEmbed(action, color, moderator, targetUser, fields = []) {
+  const e = new EmbedBuilder()
+    .setColor(color)
+    .setAuthor({ name: `${action} • ${targetUser.tag}`, iconURL: targetUser.displayAvatarURL() })
+    .addFields(
+      { name: "User", value: `<@${targetUser.id}> (\`${targetUser.id}\`)`, inline: true },
+      { name: "Moderator", value: `<@${moderator.id}> (${moderator.tag})`, inline: true },
+      ...fields,
+    )
+    .setTimestamp(new Date());
+  return e;
+}
+async function sendModLog(guild, embed) {
+  const cfg = getTicketConfig(guild.id);
+  if (!cfg?.logChannelId) return;
+  try {
+    const ch = await client.channels.fetch(cfg.logChannelId);
+    await ch.send({ embeds: [embed] });
+  } catch (err) {
+    console.error("Mod log send failed:", err.message);
+  }
+}
+async function dmTarget(user, guildName, action, reason, extra = "") {
+  try {
+    const dm = await user.createDM();
+    await dm.send(
+      `You have been **${action}** in **${guildName}**.\nReason: ${reason || "No reason provided"}${extra ? `\n${extra}` : ""}`,
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function performBan(guild, moderator, targetUser, reason, deleteSeconds = 0) {
+  const targetMember = await guild.members.fetch(targetUser.id).catch(() => null);
+  if (targetMember) {
+    const c = canModerate(moderator, targetMember);
+    if (!c.ok) return { ok: false, reason: c.reason };
+  }
+  const dmed = await dmTarget(targetUser, guild.name, "banned", reason);
+  try {
+    await guild.bans.create(targetUser.id, {
+      reason: `By ${moderator.user.tag}: ${reason || "No reason"}`,
+      deleteMessageSeconds: deleteSeconds,
+    });
+  } catch (err) {
+    return { ok: false, reason: err.message };
+  }
+  await sendModLog(
+    guild,
+    modLogEmbed("Member Banned", 0xed4245, moderator.user, targetUser, [
+      { name: "Reason", value: reason || "No reason provided", inline: false },
+      { name: "DM Sent", value: dmed ? "Yes" : "No (DMs closed)", inline: true },
+    ]),
+  );
+  return { ok: true, dmed };
+}
+
+async function performUnban(guild, moderator, targetUser, reason) {
+  try {
+    await guild.bans.remove(targetUser.id, `By ${moderator.user.tag}: ${reason || "No reason"}`);
+  } catch (err) {
+    return { ok: false, reason: err.message.includes("Unknown Ban") ? "That user isn't banned." : err.message };
+  }
+  await sendModLog(
+    guild,
+    modLogEmbed("Member Unbanned", 0x57f287, moderator.user, targetUser, [
+      { name: "Reason", value: reason || "No reason provided", inline: false },
+    ]),
+  );
+  return { ok: true };
+}
+
+async function performKick(guild, moderator, targetMember, reason) {
+  const c = canModerate(moderator, targetMember);
+  if (!c.ok) return { ok: false, reason: c.reason };
+  const dmed = await dmTarget(targetMember.user, guild.name, "kicked", reason);
+  try {
+    await targetMember.kick(`By ${moderator.user.tag}: ${reason || "No reason"}`);
+  } catch (err) {
+    return { ok: false, reason: err.message };
+  }
+  await sendModLog(
+    guild,
+    modLogEmbed("Member Kicked", 0xfee75c, moderator.user, targetMember.user, [
+      { name: "Reason", value: reason || "No reason provided", inline: false },
+      { name: "DM Sent", value: dmed ? "Yes" : "No (DMs closed)", inline: true },
+    ]),
+  );
+  return { ok: true, dmed };
+}
+
+async function performTimeout(guild, moderator, targetMember, durationMs, reason) {
+  if (!durationMs || durationMs < 1000) return { ok: false, reason: "Invalid duration. Use formats like `10m`, `2h`, `1d` (max 28d)." };
+  if (durationMs > 28 * 86400000) return { ok: false, reason: "Discord's max timeout is 28 days." };
+  const c = canModerate(moderator, targetMember);
+  if (!c.ok) return { ok: false, reason: c.reason };
+  const pretty = formatDuration(durationMs);
+  const dmed = await dmTarget(targetMember.user, guild.name, `muted for ${pretty}`, reason);
+  try {
+    await targetMember.timeout(durationMs, `By ${moderator.user.tag}: ${reason || "No reason"}`);
+  } catch (err) {
+    return { ok: false, reason: err.message };
+  }
+  await sendModLog(
+    guild,
+    modLogEmbed("Member Muted", 0xeb459e, moderator.user, targetMember.user, [
+      { name: "Duration", value: pretty, inline: true },
+      { name: "Expires", value: `<t:${Math.floor((Date.now() + durationMs) / 1000)}:R>`, inline: true },
+      { name: "Reason", value: reason || "No reason provided", inline: false },
+      { name: "DM Sent", value: dmed ? "Yes" : "No (DMs closed)", inline: true },
+    ]),
+  );
+  return { ok: true, pretty, dmed };
+}
+
+async function performUntimeout(guild, moderator, targetMember, reason) {
+  const c = canModerate(moderator, targetMember);
+  if (!c.ok) return { ok: false, reason: c.reason };
+  if (!targetMember.communicationDisabledUntilTimestamp || targetMember.communicationDisabledUntilTimestamp < Date.now()) {
+    return { ok: false, reason: "That member isn't muted." };
+  }
+  try {
+    await targetMember.timeout(null, `By ${moderator.user.tag}: ${reason || "Unmuted"}`);
+  } catch (err) {
+    return { ok: false, reason: err.message };
+  }
+  await sendModLog(
+    guild,
+    modLogEmbed("Member Unmuted", 0x57f287, moderator.user, targetMember.user, [
+      { name: "Reason", value: reason || "No reason provided", inline: false },
+    ]),
+  );
+  return { ok: true };
+}
+
+async function performPurge(channel, amount, filterUserId) {
+  amount = Math.max(1, Math.min(100, parseInt(amount, 10) || 0));
+  if (!amount) return { ok: false, reason: "Tell me how many messages to delete (1–100)." };
+  let messages = await channel.messages.fetch({ limit: filterUserId ? 100 : amount }).catch(() => null);
+  if (!messages) return { ok: false, reason: "Couldn't fetch messages here." };
+  if (filterUserId) {
+    messages = messages.filter((m) => m.author.id === filterUserId).first(amount);
+  } else {
+    messages = Array.from(messages.values());
+  }
+  const tooOld = Date.now() - 14 * 86400000;
+  const deletable = messages.filter((m) => m.createdTimestamp > tooOld);
+  if (!deletable.length) return { ok: false, reason: "No messages newer than 14 days to delete." };
+  try {
+    const deleted = await channel.bulkDelete(deletable, true);
+    return { ok: true, count: deleted.size };
+  } catch (err) {
+    return { ok: false, reason: err.message };
+  }
+}
+
+function addWarning(guildId, userId, modId, reason) {
+  if (!store.warns[guildId]) store.warns[guildId] = {};
+  if (!store.warns[guildId][userId]) store.warns[guildId][userId] = [];
+  store.warnCounter = (store.warnCounter || 0) + 1;
+  const entry = { id: store.warnCounter, modId, reason: reason || "No reason provided", at: Date.now() };
+  store.warns[guildId][userId].push(entry);
+  saveData(store);
+  return entry;
+}
+function getWarnings(guildId, userId) {
+  return store.warns?.[guildId]?.[userId] || [];
+}
+function clearWarnings(guildId, userId) {
+  const list = getWarnings(guildId, userId);
+  if (!list.length) return 0;
+  delete store.warns[guildId][userId];
+  saveData(store);
+  return list.length;
+}
+
+async function performWarn(guild, moderator, targetUser, reason) {
+  const targetMember = await guild.members.fetch(targetUser.id).catch(() => null);
+  if (targetMember) {
+    const c = canModerate(moderator, targetMember);
+    if (!c.ok) return { ok: false, reason: c.reason };
+  }
+  const entry = addWarning(guild.id, targetUser.id, moderator.id, reason);
+  const total = getWarnings(guild.id, targetUser.id).length;
+  const dmed = await dmTarget(targetUser, guild.name, "warned", reason, `This is warning **#${total}**.`);
+  await sendModLog(
+    guild,
+    modLogEmbed("Member Warned", 0xfee75c, moderator.user, targetUser, [
+      { name: "Warn ID", value: `#${entry.id}`, inline: true },
+      { name: "Total Warnings", value: String(total), inline: true },
+      { name: "Reason", value: reason || "No reason provided", inline: false },
+      { name: "DM Sent", value: dmed ? "Yes" : "No (DMs closed)", inline: true },
+    ]),
+  );
+  return { ok: true, total, entry, dmed };
+}
+
+function warningsEmbed(targetUser, list) {
+  const e = new EmbedBuilder()
+    .setColor(0xfee75c)
+    .setAuthor({ name: `Warnings • ${targetUser.tag}`, iconURL: targetUser.displayAvatarURL() })
+    .setDescription(
+      list.length
+        ? list
+            .slice(-15)
+            .map(
+              (w) =>
+                `**#${w.id}** • <t:${Math.floor(w.at / 1000)}:R> by <@${w.modId}>\n┗ ${w.reason}`,
+            )
+            .join("\n\n")
+        : "No warnings on record.",
+    )
+    .setFooter({ text: `Total: ${list.length}` });
+  return e;
+}
+
+// ---------- Slash handler wrappers ----------
+function hasPerm(member, flag) {
+  return member?.permissions?.has(flag);
+}
+
+async function handleBanSlash(interaction) {
+  if (!hasPerm(interaction.member, PermissionFlagsBits.BanMembers)) {
+    return interaction.reply({ content: "You need **Ban Members** permission.", flags: MessageFlags.Ephemeral });
+  }
+  await interaction.deferReply();
+  const targetUser = await resolveUser(interaction.options.getString("user", true));
+  if (!targetUser) return interaction.editReply("Couldn't find that user.");
+  const reason = interaction.options.getString("reason");
+  const days = interaction.options.getInteger("delete_days") || 0;
+  const r = await performBan(interaction.guild, interaction.member, targetUser, reason, days * 86400);
+  return interaction.editReply(r.ok ? `Banned **${targetUser.tag}**.${r.dmed ? "" : " (DM not delivered.)"}` : `Failed: ${r.reason}`);
+}
+async function handleUnbanSlash(interaction) {
+  if (!hasPerm(interaction.member, PermissionFlagsBits.BanMembers)) {
+    return interaction.reply({ content: "You need **Ban Members** permission.", flags: MessageFlags.Ephemeral });
+  }
+  await interaction.deferReply();
+  const targetUser = await resolveUser(interaction.options.getString("user_id", true));
+  if (!targetUser) return interaction.editReply("Couldn't find that user ID.");
+  const r = await performUnban(interaction.guild, interaction.member, targetUser, interaction.options.getString("reason"));
+  return interaction.editReply(r.ok ? `Unbanned **${targetUser.tag}**.` : `Failed: ${r.reason}`);
+}
+async function handleKickSlash(interaction) {
+  if (!hasPerm(interaction.member, PermissionFlagsBits.KickMembers)) {
+    return interaction.reply({ content: "You need **Kick Members** permission.", flags: MessageFlags.Ephemeral });
+  }
+  await interaction.deferReply();
+  const targetMember = await interaction.guild.members.fetch(interaction.options.getUser("user", true).id).catch(() => null);
+  if (!targetMember) return interaction.editReply("That user isn't in the server.");
+  const r = await performKick(interaction.guild, interaction.member, targetMember, interaction.options.getString("reason"));
+  return interaction.editReply(r.ok ? `Kicked **${targetMember.user.tag}**.${r.dmed ? "" : " (DM not delivered.)"}` : `Failed: ${r.reason}`);
+}
+async function handlePurgeSlash(interaction) {
+  if (!hasPerm(interaction.member, PermissionFlagsBits.ManageMessages)) {
+    return interaction.reply({ content: "You need **Manage Messages** permission.", flags: MessageFlags.Ephemeral });
+  }
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const amount = interaction.options.getInteger("amount", true);
+  const user = interaction.options.getUser("user");
+  const r = await performPurge(interaction.channel, amount, user?.id);
+  return interaction.editReply(r.ok ? `Deleted **${r.count}** message${r.count === 1 ? "" : "s"}.` : `Failed: ${r.reason}`);
+}
+async function handleTimeoutSlash(interaction) {
+  if (!hasPerm(interaction.member, PermissionFlagsBits.ModerateMembers)) {
+    return interaction.reply({ content: "You need **Moderate Members** permission.", flags: MessageFlags.Ephemeral });
+  }
+  await interaction.deferReply();
+  const targetMember = await interaction.guild.members.fetch(interaction.options.getUser("user", true).id).catch(() => null);
+  if (!targetMember) return interaction.editReply("That user isn't in the server.");
+  const ms = parseDuration(interaction.options.getString("duration", true));
+  const r = await performTimeout(interaction.guild, interaction.member, targetMember, ms, interaction.options.getString("reason"));
+  return interaction.editReply(r.ok ? `Muted **${targetMember.user.tag}** for **${r.pretty}**.${r.dmed ? "" : " (DM not delivered.)"}` : `Failed: ${r.reason}`);
+}
+async function handleUntimeoutSlash(interaction) {
+  if (!hasPerm(interaction.member, PermissionFlagsBits.ModerateMembers)) {
+    return interaction.reply({ content: "You need **Moderate Members** permission.", flags: MessageFlags.Ephemeral });
+  }
+  await interaction.deferReply();
+  const targetMember = await interaction.guild.members.fetch(interaction.options.getUser("user", true).id).catch(() => null);
+  if (!targetMember) return interaction.editReply("That user isn't in the server.");
+  const r = await performUntimeout(interaction.guild, interaction.member, targetMember, interaction.options.getString("reason"));
+  return interaction.editReply(r.ok ? `Unmuted **${targetMember.user.tag}**.` : `Failed: ${r.reason}`);
+}
+async function handleWarnSlash(interaction) {
+  if (!hasPerm(interaction.member, PermissionFlagsBits.ModerateMembers)) {
+    return interaction.reply({ content: "You need **Moderate Members** permission.", flags: MessageFlags.Ephemeral });
+  }
+  await interaction.deferReply();
+  const targetUser = interaction.options.getUser("user", true);
+  const r = await performWarn(interaction.guild, interaction.member, targetUser, interaction.options.getString("reason", true));
+  return interaction.editReply(r.ok ? `Warned **${targetUser.tag}** (warn #${r.entry.id}, total ${r.total}).${r.dmed ? "" : " (DM not delivered.)"}` : `Failed: ${r.reason}`);
+}
+async function handleWarningsSlash(interaction) {
+  if (!hasPerm(interaction.member, PermissionFlagsBits.ModerateMembers)) {
+    return interaction.reply({ content: "You need **Moderate Members** permission.", flags: MessageFlags.Ephemeral });
+  }
+  const targetUser = interaction.options.getUser("user", true);
+  const list = getWarnings(interaction.guildId, targetUser.id);
+  return interaction.reply({ embeds: [warningsEmbed(targetUser, list)] });
+}
+async function handleClearwarnsSlash(interaction) {
+  if (!hasPerm(interaction.member, PermissionFlagsBits.ModerateMembers)) {
+    return interaction.reply({ content: "You need **Moderate Members** permission.", flags: MessageFlags.Ephemeral });
+  }
+  const targetUser = interaction.options.getUser("user", true);
+  const n = clearWarnings(interaction.guildId, targetUser.id);
+  return interaction.reply(n ? `Cleared **${n}** warning${n === 1 ? "" : "s"} for **${targetUser.tag}**.` : `**${targetUser.tag}** had no warnings.`);
+}
+
+// ---------- Prefix command dispatcher ----------
+async function handlePrefixCommand(message) {
+  const args = message.content.slice(PREFIX.length).trim().split(/\s+/);
+  const cmd = (args.shift() || "").toLowerCase();
+  if (!cmd) return;
+  const m = message.member;
+
+  if ((cmd === "purge" || cmd === "clear") && hasPerm(m, PermissionFlagsBits.ManageMessages)) {
+    let amount = parseInt(args[0], 10);
+    let userArg = args[1];
+    let userId = userArg ? extractId(userArg) : null;
+    await message.delete().catch(() => {});
+    const r = await performPurge(message.channel, amount, userId);
+    const reply = await message.channel.send(r.ok ? `Deleted **${r.count}** message${r.count === 1 ? "" : "s"}.` : `Failed: ${r.reason}`);
+    setTimeout(() => reply.delete().catch(() => {}), 4000);
+    return;
+  }
+
+  if (cmd === "ban" && hasPerm(m, PermissionFlagsBits.BanMembers)) {
+    const targetUser = await resolveUser(args[0]);
+    if (!targetUser) return message.reply("Usage: `?ban <@user|id> [reason]`");
+    const reason = args.slice(1).join(" ") || null;
+    const r = await performBan(message.guild, m, targetUser, reason, 0);
+    return message.reply(r.ok ? `Banned **${targetUser.tag}**.${r.dmed ? "" : " (DM not delivered.)"}` : `Failed: ${r.reason}`);
+  }
+
+  if (cmd === "unban" && hasPerm(m, PermissionFlagsBits.BanMembers)) {
+    const targetUser = await resolveUser(args[0]);
+    if (!targetUser) return message.reply("Usage: `?unban <user_id> [reason]`");
+    const r = await performUnban(message.guild, m, targetUser, args.slice(1).join(" ") || null);
+    return message.reply(r.ok ? `Unbanned **${targetUser.tag}**.` : `Failed: ${r.reason}`);
+  }
+
+  if (cmd === "kick" && hasPerm(m, PermissionFlagsBits.KickMembers)) {
+    const target = await resolveMember(message.guild, args[0]);
+    if (!target) return message.reply("Usage: `?kick <@user> [reason]`");
+    const r = await performKick(message.guild, m, target, args.slice(1).join(" ") || null);
+    return message.reply(r.ok ? `Kicked **${target.user.tag}**.${r.dmed ? "" : " (DM not delivered.)"}` : `Failed: ${r.reason}`);
+  }
+
+  if ((cmd === "mute" || cmd === "timeout") && hasPerm(m, PermissionFlagsBits.ModerateMembers)) {
+    const target = await resolveMember(message.guild, args[0]);
+    if (!target) return message.reply("Usage: `?mute <@user> <duration> [reason]` (e.g. `?mute @bob 10m spamming`)");
+    const ms = parseDuration(args[1]);
+    if (!ms) return message.reply("Invalid duration. Use `10s`, `5m`, `2h`, `1d`, `1w` (max 28d).");
+    const r = await performTimeout(message.guild, m, target, ms, args.slice(2).join(" ") || null);
+    return message.reply(r.ok ? `Muted **${target.user.tag}** for **${r.pretty}**.${r.dmed ? "" : " (DM not delivered.)"}` : `Failed: ${r.reason}`);
+  }
+
+  if ((cmd === "unmute" || cmd === "untimeout") && hasPerm(m, PermissionFlagsBits.ModerateMembers)) {
+    const target = await resolveMember(message.guild, args[0]);
+    if (!target) return message.reply("Usage: `?unmute <@user> [reason]`");
+    const r = await performUntimeout(message.guild, m, target, args.slice(1).join(" ") || null);
+    return message.reply(r.ok ? `Unmuted **${target.user.tag}**.` : `Failed: ${r.reason}`);
+  }
+
+  if (cmd === "warn" && hasPerm(m, PermissionFlagsBits.ModerateMembers)) {
+    const targetUser = await resolveUser(args[0]);
+    if (!targetUser || args.length < 2) return message.reply("Usage: `?warn <@user> <reason>`");
+    const r = await performWarn(message.guild, m, targetUser, args.slice(1).join(" "));
+    return message.reply(r.ok ? `Warned **${targetUser.tag}** (warn #${r.entry.id}, total ${r.total}).${r.dmed ? "" : " (DM not delivered.)"}` : `Failed: ${r.reason}`);
+  }
+
+  if (cmd === "warnings" && hasPerm(m, PermissionFlagsBits.ModerateMembers)) {
+    const targetUser = await resolveUser(args[0]);
+    if (!targetUser) return message.reply("Usage: `?warnings <@user>`");
+    return message.reply({ embeds: [warningsEmbed(targetUser, getWarnings(message.guildId, targetUser.id))] });
+  }
+
+  if (cmd === "clearwarns" && hasPerm(m, PermissionFlagsBits.ModerateMembers)) {
+    const targetUser = await resolveUser(args[0]);
+    if (!targetUser) return message.reply("Usage: `?clearwarns <@user>`");
+    const n = clearWarnings(message.guildId, targetUser.id);
+    return message.reply(n ? `Cleared **${n}** warning${n === 1 ? "" : "s"} for **${targetUser.tag}**.` : `**${targetUser.tag}** had no warnings.`);
+  }
+
+  if (cmd === "help" || cmd === "commands") {
+    return message.reply(
+      [
+        "**Moderation commands** (prefix `?` or use slash):",
+        "`?ban <@user|id> [reason]` • `?unban <id> [reason]`",
+        "`?kick <@user> [reason]`",
+        "`?mute <@user> <duration> [reason]` • `?unmute <@user> [reason]`",
+        "`?purge <1-100> [@user]` (alias `?clear`)",
+        "`?warn <@user> <reason>` • `?warnings <@user>` • `?clearwarns <@user>`",
+        "Durations: `10s`, `5m`, `2h`, `1d`, `1w` (max 28d).",
+      ].join("\n"),
+    );
+  }
+}
+
 // ---------- Slash command definitions ----------
 const checkCommand = new SlashCommandBuilder()
   .setName("check")
@@ -1170,6 +1627,75 @@ const statusCommand = new SlashCommandBuilder()
   .setDescription("Owner only: see bot health and uptime")
   .setDMPermission(true);
 
+const banCommand = new SlashCommandBuilder()
+  .setName("ban")
+  .setDescription("Ban a member from the server")
+  .addStringOption((o) => o.setName("user").setDescription("User mention or ID").setRequired(true))
+  .addStringOption((o) => o.setName("reason").setDescription("Reason for the ban"))
+  .addIntegerOption((o) =>
+    o.setName("delete_days").setDescription("Delete this user's messages from the past N days (0–7)").setMinValue(0).setMaxValue(7),
+  )
+  .setDefaultMemberPermissions(PermissionFlagsBits.BanMembers);
+
+const unbanCommand = new SlashCommandBuilder()
+  .setName("unban")
+  .setDescription("Unban a user by ID")
+  .addStringOption((o) => o.setName("user_id").setDescription("User ID to unban").setRequired(true))
+  .addStringOption((o) => o.setName("reason").setDescription("Reason for the unban"))
+  .setDefaultMemberPermissions(PermissionFlagsBits.BanMembers);
+
+const kickCommand = new SlashCommandBuilder()
+  .setName("kick")
+  .setDescription("Kick a member from the server")
+  .addUserOption((o) => o.setName("user").setDescription("Member to kick").setRequired(true))
+  .addStringOption((o) => o.setName("reason").setDescription("Reason for the kick"))
+  .setDefaultMemberPermissions(PermissionFlagsBits.KickMembers);
+
+const purgeCommand = new SlashCommandBuilder()
+  .setName("purge")
+  .setDescription("Bulk delete recent messages in this channel (max 100, < 14 days old)")
+  .addIntegerOption((o) =>
+    o.setName("amount").setDescription("How many messages (1–100)").setRequired(true).setMinValue(1).setMaxValue(100),
+  )
+  .addUserOption((o) => o.setName("user").setDescription("Only delete messages from this user"))
+  .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages);
+
+const timeoutCommand = new SlashCommandBuilder()
+  .setName("timeout")
+  .setDescription("Mute (timeout) a member for a duration")
+  .addUserOption((o) => o.setName("user").setDescription("Member to mute").setRequired(true))
+  .addStringOption((o) =>
+    o.setName("duration").setDescription("Duration like 10m, 2h, 1d (max 28d)").setRequired(true),
+  )
+  .addStringOption((o) => o.setName("reason").setDescription("Reason for the mute"))
+  .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers);
+
+const untimeoutCommand = new SlashCommandBuilder()
+  .setName("untimeout")
+  .setDescription("Remove a mute (timeout) from a member")
+  .addUserOption((o) => o.setName("user").setDescription("Member to unmute").setRequired(true))
+  .addStringOption((o) => o.setName("reason").setDescription("Reason for the unmute"))
+  .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers);
+
+const warnCommand = new SlashCommandBuilder()
+  .setName("warn")
+  .setDescription("Warn a member")
+  .addUserOption((o) => o.setName("user").setDescription("Member to warn").setRequired(true))
+  .addStringOption((o) => o.setName("reason").setDescription("Reason for the warning").setRequired(true))
+  .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers);
+
+const warningsCommand = new SlashCommandBuilder()
+  .setName("warnings")
+  .setDescription("Show a member's warnings")
+  .addUserOption((o) => o.setName("user").setDescription("Member to look up").setRequired(true))
+  .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers);
+
+const clearwarnsCommand = new SlashCommandBuilder()
+  .setName("clearwarns")
+  .setDescription("Clear all warnings for a member")
+  .addUserOption((o) => o.setName("user").setDescription("Member to clear").setRequired(true))
+  .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers);
+
 async function registerCommands() {
   const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_BOT_TOKEN);
   await rest.put(Routes.applicationCommands(client.user.id), {
@@ -1180,6 +1706,15 @@ async function registerCommands() {
       cancelCommand.toJSON(),
       ticketCommand.toJSON(),
       statusCommand.toJSON(),
+      banCommand.toJSON(),
+      unbanCommand.toJSON(),
+      kickCommand.toJSON(),
+      purgeCommand.toJSON(),
+      timeoutCommand.toJSON(),
+      untimeoutCommand.toJSON(),
+      warnCommand.toJSON(),
+      warningsCommand.toJSON(),
+      clearwarnsCommand.toJSON(),
     ],
   });
   console.log("Slash commands registered globally.");
@@ -1444,11 +1979,21 @@ async function handleDirectMessage(message) {
 
 client.on("messageCreate", async (message) => {
   if (message.author.bot) return;
-  if (message.channel.type !== ChannelType.DM) return;
+  if (message.channel.type === ChannelType.DM) {
+    try {
+      await handleDirectMessage(message);
+    } catch (err) {
+      console.error("DM handler error:", err);
+    }
+    return;
+  }
+  if (!message.guild) return;
+  if (!message.content?.startsWith(PREFIX)) return;
   try {
-    await handleDirectMessage(message);
+    await handlePrefixCommand(message);
   } catch (err) {
-    console.error("DM handler error:", err);
+    console.error("Prefix command error:", err);
+    message.reply(`Something went wrong: \`${err.message}\``).catch(() => {});
   }
 });
 
@@ -1465,6 +2010,15 @@ client.on("interactionCreate", async (interaction) => {
         if (sub === "reroll") return handleGiveawayReroll(interaction);
       }
       if (interaction.commandName === "status") return handleStatus(interaction);
+      if (interaction.commandName === "ban") return handleBanSlash(interaction);
+      if (interaction.commandName === "unban") return handleUnbanSlash(interaction);
+      if (interaction.commandName === "kick") return handleKickSlash(interaction);
+      if (interaction.commandName === "purge") return handlePurgeSlash(interaction);
+      if (interaction.commandName === "timeout") return handleTimeoutSlash(interaction);
+      if (interaction.commandName === "untimeout") return handleUntimeoutSlash(interaction);
+      if (interaction.commandName === "warn") return handleWarnSlash(interaction);
+      if (interaction.commandName === "warnings") return handleWarningsSlash(interaction);
+      if (interaction.commandName === "clearwarns") return handleClearwarnsSlash(interaction);
       if (interaction.commandName === "ticket") {
         const group = interaction.options.getSubcommandGroup(false);
         const sub = interaction.options.getSubcommand();
