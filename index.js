@@ -79,6 +79,8 @@ function defaultData() {
     tickets: [],
     warns: {},
     warnCounter: 0,
+    autoReplies: {},
+    autoReplyCounter: 0,
   };
 }
 function loadData() {
@@ -1277,6 +1279,122 @@ async function performWarn(guild, moderator, targetUser, reason) {
   return { ok: true, total, entry, dmed };
 }
 
+async function performLock(channel, moderator, reason) {
+  const everyone = channel.guild.roles.everyone;
+  const current = channel.permissionOverwrites.cache.get(everyone.id);
+  if (current && current.deny.has(PermissionFlagsBits.SendMessages)) {
+    return { ok: false, reason: "This channel is already locked." };
+  }
+  try {
+    await channel.permissionOverwrites.edit(
+      everyone,
+      { SendMessages: false, SendMessagesInThreads: false, AddReactions: false },
+      { reason: `Locked by ${moderator.user.tag}: ${reason || "No reason"}` },
+    );
+  } catch (err) {
+    return { ok: false, reason: err.message };
+  }
+  await channel
+    .send({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(0xed4245)
+          .setTitle("🔒 Channel locked")
+          .setDescription(`Locked by <@${moderator.id}>.\n**Reason:** ${reason || "No reason provided"}`)
+          .setTimestamp(new Date()),
+      ],
+    })
+    .catch(() => {});
+  await sendModLog(
+    channel.guild,
+    modLogEmbed("Channel Locked", 0xed4245, moderator.user, moderator.user, [
+      { name: "Channel", value: `<#${channel.id}>`, inline: true },
+      { name: "Reason", value: reason || "No reason provided", inline: false },
+    ]),
+  );
+  return { ok: true };
+}
+
+async function performUnlock(channel, moderator, reason) {
+  const everyone = channel.guild.roles.everyone;
+  const current = channel.permissionOverwrites.cache.get(everyone.id);
+  if (!current || !current.deny.has(PermissionFlagsBits.SendMessages)) {
+    return { ok: false, reason: "This channel isn't locked." };
+  }
+  try {
+    await channel.permissionOverwrites.edit(
+      everyone,
+      { SendMessages: null, SendMessagesInThreads: null, AddReactions: null },
+      { reason: `Unlocked by ${moderator.user.tag}: ${reason || "No reason"}` },
+    );
+  } catch (err) {
+    return { ok: false, reason: err.message };
+  }
+  await channel
+    .send({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(0x57f287)
+          .setTitle("🔓 Channel unlocked")
+          .setDescription(`Unlocked by <@${moderator.id}>.\n**Reason:** ${reason || "No reason provided"}`)
+          .setTimestamp(new Date()),
+      ],
+    })
+    .catch(() => {});
+  await sendModLog(
+    channel.guild,
+    modLogEmbed("Channel Unlocked", 0x57f287, moderator.user, moderator.user, [
+      { name: "Channel", value: `<#${channel.id}>`, inline: true },
+      { name: "Reason", value: reason || "No reason provided", inline: false },
+    ]),
+  );
+  return { ok: true };
+}
+
+function getAutoReplies(guildId) {
+  return store.autoReplies?.[guildId] || [];
+}
+function addAutoReply(guildId, trigger, response, match) {
+  if (!store.autoReplies[guildId]) store.autoReplies[guildId] = [];
+  store.autoReplyCounter = (store.autoReplyCounter || 0) + 1;
+  const entry = {
+    id: store.autoReplyCounter,
+    trigger: trigger.slice(0, 100),
+    response: response.slice(0, 1900),
+    match: ["exact", "contains", "starts"].includes(match) ? match : "contains",
+  };
+  store.autoReplies[guildId].push(entry);
+  saveData(store);
+  return entry;
+}
+function removeAutoReplyById(guildId, id) {
+  const list = store.autoReplies[guildId];
+  if (!Array.isArray(list)) return null;
+  const idx = list.findIndex((a) => a.id === id);
+  if (idx === -1) return null;
+  const removed = list.splice(idx, 1)[0];
+  saveData(store);
+  return removed;
+}
+function clearAutoReplies(guildId) {
+  const n = (store.autoReplies[guildId] || []).length;
+  delete store.autoReplies[guildId];
+  saveData(store);
+  return n;
+}
+function matchAutoReply(guildId, content) {
+  const list = getAutoReplies(guildId);
+  if (!list.length) return null;
+  const lower = content.toLowerCase();
+  for (const a of list) {
+    const t = a.trigger.toLowerCase();
+    if (a.match === "exact" && lower === t) return a;
+    if (a.match === "starts" && lower.startsWith(t)) return a;
+    if (a.match === "contains" && lower.includes(t)) return a;
+  }
+  return null;
+}
+
 function warningsEmbed(targetUser, list) {
   const e = new EmbedBuilder()
     .setColor(0xfee75c)
@@ -1381,6 +1499,78 @@ async function handleWarningsSlash(interaction) {
   const list = getWarnings(interaction.guildId, targetUser.id);
   return interaction.reply({ embeds: [warningsEmbed(targetUser, list)] });
 }
+async function handleLockSlash(interaction) {
+  if (!hasPerm(interaction.member, PermissionFlagsBits.ManageChannels)) {
+    return interaction.reply({ content: "You need **Manage Channels** permission.", flags: MessageFlags.Ephemeral });
+  }
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const channel = interaction.options.getChannel("channel") || interaction.channel;
+  const r = await performLock(channel, interaction.member, interaction.options.getString("reason"));
+  return interaction.editReply(r.ok ? `Locked <#${channel.id}>.` : `Failed: ${r.reason}`);
+}
+
+async function handleUnlockSlash(interaction) {
+  if (!hasPerm(interaction.member, PermissionFlagsBits.ManageChannels)) {
+    return interaction.reply({ content: "You need **Manage Channels** permission.", flags: MessageFlags.Ephemeral });
+  }
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const channel = interaction.options.getChannel("channel") || interaction.channel;
+  const r = await performUnlock(channel, interaction.member, interaction.options.getString("reason"));
+  return interaction.editReply(r.ok ? `Unlocked <#${channel.id}>.` : `Failed: ${r.reason}`);
+}
+
+async function handleAutoreplyAdd(interaction) {
+  const trigger = interaction.options.getString("trigger", true).trim();
+  const response = interaction.options.getString("response", true);
+  const match = interaction.options.getString("match") || "contains";
+  if (!trigger) {
+    return interaction.reply({ content: "Trigger can't be empty.", flags: MessageFlags.Ephemeral });
+  }
+  const entry = addAutoReply(interaction.guildId, trigger, response, match);
+  return interaction.reply({
+    content: `Auto-reply **#${entry.id}** added.\n• When a message **${entry.match}** \`${entry.trigger}\` → I'll reply with: ${entry.response.slice(0, 200)}${entry.response.length > 200 ? "…" : ""}`,
+    flags: MessageFlags.Ephemeral,
+    allowedMentions: { parse: [] },
+  });
+}
+
+async function handleAutoreplyRemove(interaction) {
+  const id = interaction.options.getInteger("id", true);
+  const removed = removeAutoReplyById(interaction.guildId, id);
+  return interaction.reply({
+    content: removed ? `Removed auto-reply **#${id}** (\`${removed.trigger}\`).` : `No auto-reply with ID #${id}.`,
+    flags: MessageFlags.Ephemeral,
+    allowedMentions: { parse: [] },
+  });
+}
+
+async function handleAutoreplyList(interaction) {
+  const list = getAutoReplies(interaction.guildId);
+  const embed = new EmbedBuilder()
+    .setColor(0x5865f2)
+    .setTitle("Auto-replies")
+    .setDescription(
+      list.length
+        ? list
+            .map(
+              (a) =>
+                `**#${a.id}** • match: \`${a.match}\`\nTrigger: \`${a.trigger}\`\nReply: ${a.response.slice(0, 200)}${a.response.length > 200 ? "…" : ""}`,
+            )
+            .join("\n\n")
+        : "No auto-replies set. Add one with `/autoreply add`.",
+    )
+    .setFooter({ text: `Total: ${list.length}` });
+  return interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral, allowedMentions: { parse: [] } });
+}
+
+async function handleAutoreplyClear(interaction) {
+  const n = clearAutoReplies(interaction.guildId);
+  return interaction.reply({
+    content: n ? `Cleared **${n}** auto-repl${n === 1 ? "y" : "ies"}.` : "No auto-replies to clear.",
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
 async function handleClearwarnsSlash(interaction) {
   if (!hasPerm(interaction.member, PermissionFlagsBits.ModerateMembers)) {
     return interaction.reply({ content: "You need **Moderate Members** permission.", flags: MessageFlags.Ephemeral });
@@ -1466,6 +1656,20 @@ async function handlePrefixCommand(message) {
     return message.reply(n ? `Cleared **${n}** warning${n === 1 ? "" : "s"} for **${targetUser.tag}**.` : `**${targetUser.tag}** had no warnings.`);
   }
 
+  if (cmd === "lock" && hasPerm(m, PermissionFlagsBits.ManageChannels)) {
+    const reason = args.join(" ") || null;
+    const r = await performLock(message.channel, m, reason);
+    if (!r.ok) return message.reply(`Failed: ${r.reason}`);
+    return;
+  }
+
+  if (cmd === "unlock" && hasPerm(m, PermissionFlagsBits.ManageChannels)) {
+    const reason = args.join(" ") || null;
+    const r = await performUnlock(message.channel, m, reason);
+    if (!r.ok) return message.reply(`Failed: ${r.reason}`);
+    return;
+  }
+
   if (cmd === "help" || cmd === "commands") {
     return message.reply(
       [
@@ -1474,11 +1678,20 @@ async function handlePrefixCommand(message) {
         "`?kick <@user> [reason]`",
         "`?mute <@user> <duration> [reason]` • `?unmute <@user> [reason]`",
         "`?purge <1-100> [@user]` (alias `?clear`)",
+        "`?lock [reason]` • `?unlock [reason]`",
         "`?warn <@user> <reason>` • `?warnings <@user>` • `?clearwarns <@user>`",
+        "Auto-reply (slash only): `/autoreply add|remove|list|clear`",
         "Durations: `10s`, `5m`, `2h`, `1d`, `1w` (max 28d).",
       ].join("\n"),
     );
   }
+}
+
+async function maybeAutoReply(message) {
+  if (!message.guild || !message.content) return;
+  const match = matchAutoReply(message.guildId, message.content);
+  if (!match) return;
+  await message.reply({ content: match.response, allowedMentions: { parse: [] } }).catch(() => {});
 }
 
 // ---------- Slash command definitions ----------
@@ -1696,6 +1909,54 @@ const clearwarnsCommand = new SlashCommandBuilder()
   .addUserOption((o) => o.setName("user").setDescription("Member to clear").setRequired(true))
   .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers);
 
+const lockCommand = new SlashCommandBuilder()
+  .setName("lock")
+  .setDescription("Lock a channel so @everyone can't send messages")
+  .addChannelOption((o) =>
+    o.setName("channel").setDescription("Channel to lock (default: current)").addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement),
+  )
+  .addStringOption((o) => o.setName("reason").setDescription("Reason for the lock"))
+  .setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels);
+
+const unlockCommand = new SlashCommandBuilder()
+  .setName("unlock")
+  .setDescription("Unlock a previously locked channel")
+  .addChannelOption((o) =>
+    o.setName("channel").setDescription("Channel to unlock (default: current)").addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement),
+  )
+  .addStringOption((o) => o.setName("reason").setDescription("Reason for the unlock"))
+  .setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels);
+
+const autoreplyCommand = new SlashCommandBuilder()
+  .setName("autoreply")
+  .setDescription("Manage automatic replies")
+  .addSubcommand((s) =>
+    s
+      .setName("add")
+      .setDescription("Add an auto-reply trigger")
+      .addStringOption((o) => o.setName("trigger").setDescription("Text that activates the reply").setRequired(true).setMaxLength(100))
+      .addStringOption((o) => o.setName("response").setDescription("What I should reply with").setRequired(true).setMaxLength(1900))
+      .addStringOption((o) =>
+        o
+          .setName("match")
+          .setDescription("How to match the trigger (default: contains)")
+          .addChoices(
+            { name: "contains  — anywhere in the message", value: "contains" },
+            { name: "exact     — message equals trigger", value: "exact" },
+            { name: "starts    — message starts with trigger", value: "starts" },
+          ),
+      ),
+  )
+  .addSubcommand((s) =>
+    s
+      .setName("remove")
+      .setDescription("Remove an auto-reply by its ID")
+      .addIntegerOption((o) => o.setName("id").setDescription("ID from /autoreply list").setRequired(true).setMinValue(1)),
+  )
+  .addSubcommand((s) => s.setName("list").setDescription("List all auto-replies"))
+  .addSubcommand((s) => s.setName("clear").setDescription("Remove all auto-replies"))
+  .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild);
+
 async function registerCommands() {
   const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_BOT_TOKEN);
   await rest.put(Routes.applicationCommands(client.user.id), {
@@ -1715,6 +1976,9 @@ async function registerCommands() {
       warnCommand.toJSON(),
       warningsCommand.toJSON(),
       clearwarnsCommand.toJSON(),
+      lockCommand.toJSON(),
+      unlockCommand.toJSON(),
+      autoreplyCommand.toJSON(),
     ],
   });
   console.log("Slash commands registered globally.");
@@ -1988,12 +2252,19 @@ client.on("messageCreate", async (message) => {
     return;
   }
   if (!message.guild) return;
-  if (!message.content?.startsWith(PREFIX)) return;
+  if (message.content?.startsWith(PREFIX)) {
+    try {
+      await handlePrefixCommand(message);
+    } catch (err) {
+      console.error("Prefix command error:", err);
+      message.reply(`Something went wrong: \`${err.message}\``).catch(() => {});
+    }
+    return;
+  }
   try {
-    await handlePrefixCommand(message);
+    await maybeAutoReply(message);
   } catch (err) {
-    console.error("Prefix command error:", err);
-    message.reply(`Something went wrong: \`${err.message}\``).catch(() => {});
+    console.error("Auto-reply error:", err);
   }
 });
 
@@ -2019,6 +2290,15 @@ client.on("interactionCreate", async (interaction) => {
       if (interaction.commandName === "warn") return handleWarnSlash(interaction);
       if (interaction.commandName === "warnings") return handleWarningsSlash(interaction);
       if (interaction.commandName === "clearwarns") return handleClearwarnsSlash(interaction);
+      if (interaction.commandName === "lock") return handleLockSlash(interaction);
+      if (interaction.commandName === "unlock") return handleUnlockSlash(interaction);
+      if (interaction.commandName === "autoreply") {
+        const sub = interaction.options.getSubcommand();
+        if (sub === "add") return handleAutoreplyAdd(interaction);
+        if (sub === "remove") return handleAutoreplyRemove(interaction);
+        if (sub === "list") return handleAutoreplyList(interaction);
+        if (sub === "clear") return handleAutoreplyClear(interaction);
+      }
       if (interaction.commandName === "ticket") {
         const group = interaction.options.getSubcommandGroup(false);
         const sub = interaction.options.getSubcommand();
